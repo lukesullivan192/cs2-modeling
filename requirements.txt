@@ -1,0 +1,5 @@
+seleniumbase>=4.31.0
+beautifulsoup4>=4.12.3
+patool>=2.4.0
+demoparser2>=0.1.9
+pandas>=2.0.0
