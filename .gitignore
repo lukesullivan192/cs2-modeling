@@ -3,3 +3,5 @@ __pycache__/
 demos/
 downloaded_files/
 data/
+venv/
+.claude/
