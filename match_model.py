@@ -50,21 +50,28 @@ periods in principle -- vanishingly likely at any given period, but not
 impossible, so a hard cap (MAX_OT_PERIODS) forces a resolution once
 continuing further couldn't matter.
 
-MatchSimulator computes this as a *forward* probability propagation
-(a probability distribution over states, advanced one round at a time),
-not a top-down recursion -- a naive "recurse into both branches per
-round, one model call per node" version means up to ~2^24 tree nodes for
-regulation alone, each paying full Python/pandas/XGBoost call overhead,
-and was confirmed intractable (killed after 5+ minutes with zero output
-on real data). The forward version batches every currently-active state's
-round_model and economy_model calls into one vectorized prediction per
-round, splits each state's probability mass into its win/lose branches,
-and re-aggregates by a lightly-quantized state (see EQUIP_ROUND_TO) so
-branches that land on essentially the same state merge their mass instead
-of both continuing to branch separately. A branch that lands on a decided
-match has its mass folded into the running total immediately rather than
-propagated further, so the active distribution is guaranteed to empty out
-within a bounded number of rounds.
+MatchSimulator computes this as a *forward* graph expansion (a set of
+active states, advanced one round-depth at a time), not a top-down
+recursion -- a naive "recurse into both branches per round, one model
+call per node" version means up to ~2^24 tree nodes for regulation alone,
+each paying full Python/pandas/XGBoost call overhead, and was confirmed
+intractable (killed after 5+ minutes with zero output on real data). It
+also resolves a whole *batch* of seed states at once (test mode's every
+(match, round) query, in one call) rather than one independent
+simulation per seed: at each round-depth it batches every not-yet-
+resolved state's round_model/economy_model calls into one vectorized
+prediction, and dedupes children by a lightly-quantized state (see
+EQUIP_ROUND_TO) so branches -- from the same seed *or different seeds* --
+that land on essentially the same state become one node instead of
+separate subtrees. Once expansion empties out (guaranteed -- see below),
+each state's P(CT wins) is resolved bottom-up (children before parents,
+valid because every round strictly increases total rounds decided) and
+cached for the simulator's lifetime, so later `resolve` calls reuse any
+state an earlier call already worked out. This sharing is most of the
+DP's real cost: two rounds of the same match share almost their entire
+future, and re-deriving that future from scratch per (match, round)
+query -- thousands of times over a test set -- was the actual bottleneck,
+not any single simulation being slow.
 
 Two modes:
   train  Ensures round_model.json and economy_model.json exist by
@@ -93,6 +100,7 @@ Usage:
 """
 import argparse
 import os
+import time
 from collections import defaultdict, namedtuple
 
 import pandas as pd
@@ -211,52 +219,108 @@ class MatchSimulator:
     to compute P(CT wins the match) from any pre-round state via the DP
     described in the module docstring.
 
-    Implemented as a *forward* probability propagation, not a top-down
-    recursion: a naive "recurse on each of the 2 branches per round, one
-    model call per node" approach means up to ~2^24 tree nodes just for
-    regulation, each paying full Python/pandas/XGBoost call overhead --
-    intractably slow in practice (confirmed: killed after 5+ minutes with
-    zero output on real data). Instead, this keeps a probability
-    distribution over quantized states one round at a time -- {state:
-    probability mass} -- and at each round batches every active state's
-    round_model and economy_model calls into a single vectorized
-    prediction each, splits each state's mass into its win/lose branches,
-    and re-aggregates by quantized state so branches that reconverge
-    merge instead of multiplying. Any branch that lands on a decided
-    match has its mass folded into the running CT/T total immediately
-    and drops out of the active distribution. Because every round strictly
-    increases total rounds decided and _match_winner forces a resolution
-    by MAX_OT_PERIODS, the active distribution is guaranteed to empty out
-    within a bounded number of rounds.
+    Implemented as a *forward* graph expansion, not a top-down recursion:
+    a naive "recurse on each of the 2 branches per round, one model call
+    per node" approach means up to ~2^24 tree nodes just for regulation,
+    each paying full Python/pandas/XGBoost call overhead -- intractably
+    slow in practice (confirmed: killed after 5+ minutes with zero output
+    on real data). `resolve` additionally takes a whole batch of seed
+    states at once (e.g. every held-out round across every match in
+    run_test) and expands them together, one shared frontier keyed on the
+    *quantized* state: at each round-depth it batches every currently
+    unresolved state's round_model/economy_model calls into a single
+    vectorized prediction, and dedupes children by quantized state so
+    branches from *different* seeds that land on essentially the same
+    state (constant in practice -- most rounds only differ by a few
+    dollars of equip value, quantized away by EQUIP_ROUND_TO) become one
+    node instead of separate subtrees.
+
+    Once the frontier empties (guaranteed -- every round strictly
+    increases total rounds decided, and _match_winner forces a resolution
+    by MAX_OT_PERIODS), each state's value is resolved bottom-up in
+    reverse discovery order (children before parents -- valid because
+    discovery order is already topological, for the same reason) and
+    cached in `self._value_cache` for the simulator's lifetime. Resolving
+    a state is a pure function of that state onward -- it doesn't depend
+    on how much probability mass reached it or from which seed -- so the
+    cache carries over across `resolve` calls too: a later call that
+    happens to revisit a state an earlier call already resolved gets it
+    for free. This sharing is most of where the DP's cost actually goes:
+    a naive one-simulation-per-query approach redundantly re-derives
+    almost the same future for every one of the thousands of (match,
+    round) queries run_test makes (round 5 and round 6 of the same match
+    share nearly their entire remaining match), and re-doing that from
+    scratch per query -- rather than once, shared -- was the real
+    bottleneck.
     """
 
     def __init__(self, round_clf, economy_reg):
         self.round_clf = round_clf
         self.economy_reg = economy_reg
-        self._start_cache = {}
+        self._value_cache = {}  # quantized _State -> P(CT wins); includes terminal states
+
+    @property
+    def resolved_state_count(self):
+        return len(self._value_cache)
+
+    def _resolved(self, state):
+        """Returns state's cached-or-terminal value, or None if it still
+        needs a model-driven expansion. Terminal states are cached on
+        first sight so later lookups (including from other seeds/calls)
+        skip _match_winner entirely."""
+        cached = self._value_cache.get(state)
+        if cached is not None:
+            return cached
+        winner = _match_winner(state.ct_score, state.t_score)
+        if winner is None:
+            return None
+        value = 1.0 if winner == "CT" else 0.0
+        self._value_cache[state] = value
+        return value
 
     def p_ct_wins_match(self, ct_score, t_score, ct_equip_value, t_equip_value,
                          ct_loss_bonus_streak, t_loss_bonus_streak):
-        winner = _match_winner(ct_score, t_score)
-        if winner is not None:
-            return 1.0 if winner == "CT" else 0.0
+        """Convenience single-state wrapper around `resolve` (see there
+        for the batched form run_test uses)."""
+        return self.resolve([(
+            ct_score, t_score, ct_equip_value, t_equip_value,
+            ct_loss_bonus_streak, t_loss_bonus_streak,
+        )])[0]
 
-        cache_key = (ct_score, t_score, float(ct_equip_value), float(t_equip_value),
-                     int(ct_loss_bonus_streak), int(t_loss_bonus_streak))
-        cached = self._start_cache.get(cache_key)
-        if cached is not None:
-            return cached
+    def resolve(self, seeds, verbose=False):
+        """Computes P(CT wins the match) for every (ct_score, t_score,
+        ct_equip_value, t_equip_value, ct_loss_bonus_streak,
+        t_loss_bonus_streak) tuple in `seeds`, sharing all downstream
+        model-driven work -- across the seeds in this call *and* across
+        any previous `resolve`/`p_ct_wins_match` calls on this simulator
+        -- via `self._value_cache`. Returns a list of probabilities
+        aligned with `seeds`."""
+        start_states = [
+            _quantize(_State(cs, ts, float(ce), float(te), int(cls_), int(tls)))
+            for cs, ts, ce, te, cls_, tls in seeds
+        ]
 
-        start = _quantize(_State(
-            ct_score, t_score, float(ct_equip_value), float(t_equip_value),
-            int(ct_loss_bonus_streak), int(t_loss_bonus_streak),
-        ))
-
-        ct_total = 0.0
-        active = {start: 1.0}
-        while active:
-            states = list(active.keys())
-            masses = [active[s] for s in states]
+        # Forward discovery pass: find every not-yet-resolved state
+        # reachable from these seeds. Seeds start at different round
+        # numbers (e.g. round 1 of one match, round 20 of another), so
+        # the number of BFS *iterations* to reach a given state isn't a
+        # valid topological order -- two different seeds can discover the
+        # very same state after different numbers of steps. What's
+        # invariant is the state's own total rounds decided
+        # (ct_score + t_score), which strictly increases by 1 every round
+        # regardless of path length, so states are bucketed by that for
+        # resolving in reverse below, separately from the iteration loop
+        # (kept only to batch model calls across everything active).
+        children = {}
+        by_total = defaultdict(set)
+        frontier = {s for s in start_states if self._resolved(s) is None}
+        visited = set(frontier)
+        for s in frontier:
+            by_total[s.ct_score + s.t_score].add(s)
+        iterations = 0
+        while frontier:
+            iterations += 1
+            states = list(frontier)
 
             round_df = pd.DataFrame(
                 [{"ct_equip_value": s.ct_equip, "t_equip_value": s.t_equip} for s in states]
@@ -278,22 +342,40 @@ class MatchSimulator:
             next_ct_equip = econ_preds[0::2]
             next_t_equip = econ_preds[1::2]
 
-            next_active = defaultdict(float)
-            for s, mass, p_ct, nce, nte in zip(states, masses, p_ct_round, next_ct_equip, next_t_equip):
-                for ct_won, branch_mass in ((True, mass * p_ct), (False, mass * (1 - p_ct))):
-                    branch = _quantize(_advance_state(s, ct_won, nce, nte))
-                    winner = _match_winner(branch.ct_score, branch.t_score)
-                    if winner == "CT":
-                        ct_total += branch_mass
-                    elif winner == "T":
-                        pass  # only need the CT total; T's share is implicitly 1 - ct_total
-                    else:
-                        next_active[branch] += branch_mass
+            next_frontier = set()
+            for s, p_ct, nce, nte in zip(states, p_ct_round, next_ct_equip, next_t_equip):
+                ct_child = _quantize(_advance_state(s, True, nce, nte))
+                t_child = _quantize(_advance_state(s, False, nce, nte))
+                children[s] = (p_ct, ct_child, t_child)
+                for child in (ct_child, t_child):
+                    if child not in visited and self._resolved(child) is None:
+                        visited.add(child)
+                        next_frontier.add(child)
+                        by_total[child.ct_score + child.t_score].add(child)
+            frontier = next_frontier
 
-            active = next_active
+            if verbose:
+                print(
+                    f"  iteration {iterations}: {len(states)} active state(s), "
+                    f"{self.resolved_state_count} resolved so far",
+                    end="\r", flush=True,
+                )
+        if verbose and iterations:
+            print()
 
-        self._start_cache[cache_key] = ct_total
-        return ct_total
+        # Resolve bottom-up in strictly decreasing total-rounds-decided
+        # order: every state's children have total + 1, so by the time a
+        # total bucket is processed, both its children are already
+        # terminal/cached or sitting in an already-processed (higher)
+        # bucket.
+        for total in sorted(by_total, reverse=True):
+            for s in by_total[total]:
+                p_ct, ct_child, t_child = children[s]
+                self._value_cache[s] = (
+                    p_ct * self._value_cache[ct_child] + (1 - p_ct) * self._value_cache[t_child]
+                )
+
+        return [self._value_cache[s] for s in start_states]
 
 
 def _fit_round_model(df):
@@ -354,29 +436,50 @@ def run_test():
 
     simulator = MatchSimulator(round_clf, economy_reg)
 
+    total_matches = test_df[ID_COL].nunique()
+    # Last row per match_id gives that match's real final winner.
+    match_final_ct_won = test_df.groupby(ID_COL)["winner_is_ct"].last()
+
+    # Collect every held-out round's pre-round state as one big batch of
+    # DP seeds, instead of looping match-by-match/round-by-round -- see
+    # MatchSimulator.resolve for why resolving them together (rather than
+    # as independent simulations) is what actually makes this fast: most
+    # of these seeds share almost their entire remaining-match future.
+    seeds, round_nums, match_ids = [], [], []
+    for r in test_df.itertuples(index=False):
+        seeds.append((
+            r.ct_score, r.t_score, r.ct_equip_value, r.t_equip_value,
+            r.ct_loss_bonus_streak, r.t_loss_bonus_streak,
+        ))
+        round_nums.append(int(r.ct_score + r.t_score) + 1)  # derived -- round_num isn't a stored column
+        match_ids.append(getattr(r, ID_COL))
+
+    print(
+        f"\nResolving the DP over {len(seeds)} round-level states "
+        f"across {total_matches} held-out match(es)..."
+    )
+    start_time = time.time()
+    p_ct_all = simulator.resolve(seeds, verbose=True)
+    elapsed = time.time() - start_time
+    print(f"  done in {elapsed:.1f}s ({simulator.resolved_state_count} distinct states resolved)")
+
     per_round_correct = defaultdict(list)
     per_round_baseline_correct = defaultdict(list)
 
-    for _, match_rows in test_df.groupby(ID_COL):
-        true_ct_won = bool(match_rows["winner_is_ct"].iloc[-1])
+    for (ct_score, t_score, ct_equip_value, t_equip_value, *_), round_num, match_id, p_ct in zip(
+        seeds, round_nums, match_ids, p_ct_all
+    ):
+        true_ct_won = bool(match_final_ct_won[match_id])
+        predicted_ct_won = p_ct >= 0.5
+        per_round_correct[round_num].append(predicted_ct_won == true_ct_won)
 
-        for _, r in match_rows.iterrows():
-            round_num = int(r["ct_score"] + r["t_score"]) + 1  # derived -- round_num isn't a stored column
-
-            p_ct = simulator.p_ct_wins_match(
-                r["ct_score"], r["t_score"], r["ct_equip_value"], r["t_equip_value"],
-                r["ct_loss_bonus_streak"], r["t_loss_bonus_streak"],
-            )
-            predicted_ct_won = p_ct >= 0.5
-            per_round_correct[round_num].append(predicted_ct_won == true_ct_won)
-
-            # Naive baseline: whoever's currently leading on the scoreboard
-            # (equip advantage breaks a tied score) wins the match.
-            if r["ct_score"] != r["t_score"]:
-                baseline_ct_won = r["ct_score"] > r["t_score"]
-            else:
-                baseline_ct_won = r["ct_equip_value"] >= r["t_equip_value"]
-            per_round_baseline_correct[round_num].append(baseline_ct_won == true_ct_won)
+        # Naive baseline: whoever's currently leading on the scoreboard
+        # (equip advantage breaks a tied score) wins the match.
+        if ct_score != t_score:
+            baseline_ct_won = ct_score > t_score
+        else:
+            baseline_ct_won = ct_equip_value >= t_equip_value
+        per_round_baseline_correct[round_num].append(baseline_ct_won == true_ct_won)
 
     print(f"\n{'Round':>6}  {'DP acc':>8}  {'Baseline':>8}  {'n':>5}")
     all_correct, all_baseline = [], []
