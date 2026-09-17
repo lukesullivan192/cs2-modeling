@@ -24,15 +24,15 @@ Two modes:
 At ~100 matches, this problem is starved for data relative to how much
 signal a plain "throw every raw column at a deep XGBoost" setup needs --
 the fit will overfit to per-match noise well before it exhausts the real
-economic signal in the data (e.g. ct_equip_value - t_equip_value alone is
-a strong predictor). Two things counter that here, and both were verified
-to help with 5-fold grouped cross-validation, not just eyeballed on one
-split:
-  - equip_diff / score_diff / loss_bonus_diff are added as explicit
-    features. XGBoost can in principle learn "the difference between these
-    two columns matters" on its own, but doing that from raw
-    ct_equip_value/t_equip_value costs splits that this little data can't
-    spare -- handing it the difference directly is a large, free win here.
+economic signal in the data (e.g. equip_diff alone is a strong predictor).
+Two things counter that here, and both were verified to help with 5-fold
+grouped cross-validation, not just eyeballed on one split:
+  - equip_diff / score_diff / loss_bonus_diff (CT minus T) are precomputed
+    by parse_demos.py and stored directly in round_data.csv. XGBoost can in
+    principle learn "the difference between these two columns matters" on
+    its own, but doing that from the raw ct_*/t_* pair costs splits that
+    this little data can't spare -- handing it the difference directly is
+    a large, free win here.
   - Regularization (shallow trees, min_child_weight, reg_lambda) plus
     early stopping against a held-out slice of matches, instead of a fixed
     n_estimators picked without looking at validation performance.
@@ -67,16 +67,8 @@ EARLY_STOPPING_ROUNDS = 50
 RANDOM_STATE = 42
 
 
-def _add_engineered_features(df):
-    df = df.copy()
-    df["equip_diff"] = df["ct_equip_value"] - df["t_equip_value"]
-    df["score_diff"] = df["ct_score"] - df["t_score"]
-    df["loss_bonus_diff"] = df["ct_loss_bonus_streak"] - df["t_loss_bonus_streak"]
-    return df
-
-
 def _load_data():
-    df = _add_engineered_features(pd.read_csv(ROUND_DATA_CSV))
+    df = pd.read_csv(ROUND_DATA_CSV)
     feature_cols = [c for c in df.columns if c not in (ID_COL, TARGET_COL)]
     return df[feature_cols], df[TARGET_COL], df[ID_COL]
 

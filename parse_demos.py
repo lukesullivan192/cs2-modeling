@@ -17,6 +17,12 @@ Parses CS2 .dem files into two training sets and writes them to ./data/:
   health, flash state, bomb state, elapsed time -- are dropped rather than
   carried over from data.csv's schema.
 
+Both CSVs also carry a CT-minus-T difference column for each ct_*/t_* pair
+(equip_diff, score_diff, loss_bonus_diff) alongside the raw pair itself. A
+tree-based model can in principle learn "the difference between these two
+columns matters" on its own, but at the amount of data this project has,
+that costs splits worth precomputing instead -- see `_signed_diff`.
+
 Every column in both CSVs is numeric so the files can be fed straight into
 a model: X = df.iloc[:, :-1], y = df.iloc[:, -1]. The last column,
 winner_is_ct, is a 0/1 label -- this is a binary classification problem
@@ -166,6 +172,19 @@ def _match_id(demo_file):
     """Deterministic numeric id for the source demo, for match-aware
     train/test splitting. Not a predictive feature -- see module docstring."""
     return zlib.crc32(demo_file.encode()) % 1_000_000
+
+
+def _signed_diff(ct_value, t_value):
+    """CT-minus-T difference for a paired ct_*/t_* column (e.g.
+    ct_equip_value - t_equip_value). A tree-based model can in principle
+    learn "the difference between these two columns matters" on its own,
+    but doing that from the raw pair costs splits that a small dataset
+    can't spare, so the difference is precomputed and stored directly.
+    None if either side is missing (e.g. a tick prop this demoparser2
+    version doesn't support), rather than silently treating it as 0."""
+    if ct_value is None or t_value is None:
+        return None
+    return ct_value - t_value
 
 
 def _first_present(df, candidates):
@@ -347,18 +366,26 @@ def parse_demo(demo_path):
         # fixed, uninformative values (5v5, 0, 100, 0, unplanted) -- those
         # columns are dropped here rather than carried over from data.csv's
         # schema. See module docstring.
+        round_ct_equip = int(ct0["current_equip_value"].sum()) if "current_equip_value" in ct0 else None
+        round_t_equip = int(t0["current_equip_value"].sum()) if "current_equip_value" in t0 else None
+        round_ct_loss_bonus = int(ct0["ct_losing_streak"].iloc[0]) if "ct_losing_streak" in ct0 and len(ct0) else None
+        round_t_loss_bonus = int(t0["t_losing_streak"].iloc[0]) if "t_losing_streak" in t0 and len(t0) else None
+
         round_rows.append({
             "match_id": _match_id(demo_file),
             "map_name": _map_name_to_id(map_name),
             "round_num": round_num,
             "ct_score": ct_score,
             "t_score": t_score,
-            "ct_equip_value": int(ct0["current_equip_value"].sum()) if "current_equip_value" in ct0 else None,
-            "t_equip_value": int(t0["current_equip_value"].sum()) if "current_equip_value" in t0 else None,
+            "score_diff": _signed_diff(ct_score, t_score),
+            "ct_equip_value": round_ct_equip,
+            "t_equip_value": round_t_equip,
+            "equip_diff": _signed_diff(round_ct_equip, round_t_equip),
             "ct_helmets": int(ct0["has_helmet"].sum()) if "has_helmet" in ct0 else None,
             "ct_defusers": int(ct0["has_defuser"].sum()) if "has_defuser" in ct0 else None,
-            "ct_loss_bonus_streak": int(ct0["ct_losing_streak"].iloc[0]) if "ct_losing_streak" in ct0 and len(ct0) else None,
-            "t_loss_bonus_streak": int(t0["t_losing_streak"].iloc[0]) if "t_losing_streak" in t0 and len(t0) else None,
+            "ct_loss_bonus_streak": round_ct_loss_bonus,
+            "t_loss_bonus_streak": round_t_loss_bonus,
+            "loss_bonus_diff": _signed_diff(round_ct_loss_bonus, round_t_loss_bonus),
             "winner_is_ct": int(winner_side == TEAM_CT),  # target column -- must stay last
         })
 
@@ -375,6 +402,11 @@ def parse_demo(demo_path):
 
             planted_by_now = plant_tick is not None and snap_tick >= plant_tick
 
+            snap_ct_equip = int(ct["current_equip_value"].sum()) if "current_equip_value" in ct else None
+            snap_t_equip = int(t["current_equip_value"].sum()) if "current_equip_value" in t else None
+            snap_ct_loss_bonus = int(ct["ct_losing_streak"].iloc[0]) if "ct_losing_streak" in ct and len(ct) else None
+            snap_t_loss_bonus = int(t["t_losing_streak"].iloc[0]) if "t_losing_streak" in t and len(t) else None
+
             row = {
                 "match_id": _match_id(demo_file),  # identifier for grouped splitting, not a feature -- see module docstring
                 "map_name": _map_name_to_id(map_name),
@@ -382,13 +414,15 @@ def parse_demo(demo_path):
                 "seconds_since_freeze_end": (int(snap_tick) - freeze_end_tick) / tick_rate,
                 "ct_score": ct_score,
                 "t_score": t_score,
+                "score_diff": _signed_diff(ct_score, t_score),
                 "ct_alive": ct_alive,
                 "t_alive": t_alive,
                 "ct_deaths_so_far": max(0, starting_ct_alive - ct_alive),
                 "t_deaths_so_far": max(0, starting_t_alive - t_alive),
                 "alive_diff": ct_alive - t_alive,
-                "ct_equip_value": int(ct["current_equip_value"].sum()) if "current_equip_value" in ct else None,
-                "t_equip_value": int(t["current_equip_value"].sum()) if "current_equip_value" in t else None,
+                "ct_equip_value": snap_ct_equip,
+                "t_equip_value": snap_t_equip,
+                "equip_diff": _signed_diff(snap_ct_equip, snap_t_equip),
                 "ct_avg_health": float(ct.loc[ct["is_alive"] == True, "health"].mean()) if "health" in ct and ct_alive else 0.0,
                 "t_avg_health": float(t.loc[t["is_alive"] == True, "health"].mean()) if "health" in t and t_alive else 0.0,
                 "ct_helmets": int(ct["has_helmet"].sum()) if "has_helmet" in ct else None,
@@ -400,8 +434,9 @@ def parse_demo(demo_path):
                 # captures banked economic pressure that ct/t_equip_value
                 # (money actually spent) doesn't: a team can be low-buy this
                 # round yet sitting on a high loss bonus for the next one.
-                "ct_loss_bonus_streak": int(ct["ct_losing_streak"].iloc[0]) if "ct_losing_streak" in ct and len(ct) else None,
-                "t_loss_bonus_streak": int(t["t_losing_streak"].iloc[0]) if "t_losing_streak" in t and len(t) else None,
+                "ct_loss_bonus_streak": snap_ct_loss_bonus,
+                "t_loss_bonus_streak": snap_t_loss_bonus,
+                "loss_bonus_diff": _signed_diff(snap_ct_loss_bonus, snap_t_loss_bonus),
                 "bomb_planted": int(planted_by_now),
                 "bomb_time_left": (
                     max(0.0, BOMB_TIMER_SECONDS - (int(snap_tick) - plant_tick) / tick_rate)
