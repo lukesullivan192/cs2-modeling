@@ -1,6 +1,7 @@
 # cs2-modeling
 
-Tools for building a CS2 round-outcome model from pro match demos.
+Tools for building CS2 round-outcome and round-to-round economy models from
+pro match demos.
 
 ## Setup
 
@@ -14,7 +15,7 @@ pip install -r requirements.txt
 
 1. Download demos from HLTV:
    ```bash
-   python fetch_demos.py
+   python demo_fetcher.py
    ```
    Saves `.dem` files into `demos/`.
 
@@ -22,4 +23,32 @@ pip install -r requirements.txt
    ```bash
    python parse_demos.py
    ```
-   Writes mid-round game-state snapshots to `data/data.csv`.
+   Writes two CSVs into `data/`:
+   - `data.csv`: one row per mid-round game-state snapshot.
+   - `round_data.csv`: one row per round, taken at the instant freezetime
+     ends (before anyone can move, buy, or take damage) -- the shape a
+     "forecast a round that hasn't been played yet" model needs.
+
+   Re-running only parses new demos; pass `--retry-failed` to also
+   re-attempt demos that previously failed, or `--force` to reparse
+   everything.
+
+3. Train/evaluate the round-winner model:
+   ```bash
+   python round_model.py train   # fits on all data, saves data/round_model.json
+   python round_model.py test    # match-grouped 80/20 train/test MAE/log-loss report
+   ```
+   An XGBoost classifier predicting P(CT wins) a round from each side's
+   equipment value entering it.
+
+4. Train/evaluate the round-to-round economy model:
+   ```bash
+   python economy_model.py train
+   python economy_model.py test
+   python economy_model.py predict --ct-equip 4200 --t-equip 4200 \
+       --ct-streak 1 --t-streak 1 --ct-win-prob 0.55
+   ```
+   An XGBoost regressor predicting each side's next-round equipment value
+   from its current economy state and `round_model`'s win probability for
+   the round in between -- the piece a round-to-round match simulation
+   would call each simulated round.

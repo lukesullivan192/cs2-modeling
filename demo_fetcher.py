@@ -269,4 +269,4 @@ class HLTVDemoFetcher:
 if __name__ == "__main__":
     fetcher = HLTVDemoFetcher()
     # You can now safely request a larger number like 10 or 20
-    fetcher.fetch_top_tier_demos(num_matches=10)
+    fetcher.fetch_top_tier_demos(num_matches=30)

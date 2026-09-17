@@ -8,20 +8,29 @@ Parses CS2 .dem files into two training sets and writes them to ./data/:
   round" model needs -- as opposed to one row per round or one row per kill.
 
 - round_data.csv: one row per round, taken at the instant freezetime ends
-  (before anyone can move, buy, or take damage). This is the shape a
-  "forecast a round that hasn't been played yet" model needs, for chaining
-  round predictions into a match-level Monte Carlo/DP simulation: at
-  simulation time you only ever have pre-round information (score,
-  economy, loss bonus) to condition on, so columns that are always
-  constant/uninformative at that instant -- alive counts, deaths-so-far,
-  health, flash state, bomb state, elapsed time -- are dropped rather than
-  carried over from data.csv's schema.
+  (before anyone can move, buy, or take damage): match_id, ct_score,
+  t_score, ct_equip_value, t_equip_value, ct_loss_bonus_streak,
+  t_loss_bonus_streak, winner_is_ct. This is the shape a "forecast a round
+  that hasn't been played yet" model needs, for chaining round predictions
+  into a match-level Monte Carlo/DP simulation: at simulation time you
+  only ever have pre-round information (score, economy, loss bonus) to
+  condition on, so columns that are always constant/uninformative at that
+  instant (alive counts, deaths-so-far, health, flash state, bomb state,
+  elapsed time) are dropped rather than carried over from data.csv's
+  schema, as are columns a permutation-importance test found had no
+  measurable effect on round-winner predictions (map_name, round_num,
+  helmets, defusers) and the derived score-diff/loss-bonus-diff (round
+  model trains on ct_equip_value/t_equip_value; ct_score/t_score and the
+  loss-bonus streaks are kept anyway, not as round-model features but
+  because a planned round-to-round economy transition model will need
+  them).
 
-Both CSVs also carry a CT-minus-T difference column for each ct_*/t_* pair
-(equip_diff, score_diff, loss_bonus_diff) alongside the raw pair itself. A
-tree-based model can in principle learn "the difference between these two
-columns matters" on its own, but at the amount of data this project has,
-that costs splits worth precomputing instead -- see `_signed_diff`.
+data.csv also carries a CT-minus-T difference column for each ct_*/t_*
+pair (equip_diff, score_diff, loss_bonus_diff) alongside the raw pair
+itself. A tree-based model can in principle learn "the difference between
+these two columns matters" on its own, but at the amount of data this
+project has, that costs splits worth precomputing instead -- see
+`_signed_diff`.
 
 Every column in both CSVs is numeric so the files can be fed straight into
 a model: X = df.iloc[:, :-1], y = df.iloc[:, -1]. The last column,
@@ -357,15 +366,18 @@ def parse_demo(demo_path):
         else:
             ct_score, t_score = ct_score_fallback, t_score_fallback
 
-        starting_ct_alive = int((start_state["team_num"] == TEAM_CT).sum())
-        starting_t_alive = int((start_state["team_num"] == TEAM_T).sum())
-
         # One row per round for round_data.csv, taken at the freezetime-end
-        # instant itself: equipment is locked in, nobody's moved or taken
-        # damage yet, so alive counts/deaths/health/flash/bomb state are all
-        # fixed, uninformative values (5v5, 0, 100, 0, unplanted) -- those
-        # columns are dropped here rather than carried over from data.csv's
-        # schema. See module docstring.
+        # instant itself. Trimmed to just what round_model.py trains on
+        # (ct_equip_value/t_equip_value) plus match_id/ct_score/t_score/
+        # loss-bonus streaks, kept for a planned round-to-round economy
+        # transition model, not as round-model features -- see module
+        # docstring. map_name, round_num, helmets, defusers, score_diff
+        # and loss_bonus_diff were dropped after a permutation-importance
+        # test showed no measurable effect on round-winner predictions
+        # once the equip values are known (or, for score_diff/
+        # loss_bonus_diff, because they're just ct_score-t_score / the two
+        # streaks recombined -- the transition model can recompute them
+        # from the raw pair if it ever wants to).
         round_ct_equip = int(ct0["current_equip_value"].sum()) if "current_equip_value" in ct0 else None
         round_t_equip = int(t0["current_equip_value"].sum()) if "current_equip_value" in t0 else None
         round_ct_loss_bonus = int(ct0["ct_losing_streak"].iloc[0]) if "ct_losing_streak" in ct0 and len(ct0) else None
@@ -373,19 +385,12 @@ def parse_demo(demo_path):
 
         round_rows.append({
             "match_id": _match_id(demo_file),
-            "map_name": _map_name_to_id(map_name),
-            "round_num": round_num,
             "ct_score": ct_score,
             "t_score": t_score,
-            "score_diff": _signed_diff(ct_score, t_score),
             "ct_equip_value": round_ct_equip,
             "t_equip_value": round_t_equip,
-            "equip_diff": _signed_diff(round_ct_equip, round_t_equip),
-            "ct_helmets": int(ct0["has_helmet"].sum()) if "has_helmet" in ct0 else None,
-            "ct_defusers": int(ct0["has_defuser"].sum()) if "has_defuser" in ct0 else None,
             "ct_loss_bonus_streak": round_ct_loss_bonus,
             "t_loss_bonus_streak": round_t_loss_bonus,
-            "loss_bonus_diff": _signed_diff(round_ct_loss_bonus, round_t_loss_bonus),
             "winner_is_ct": int(winner_side == TEAM_CT),  # target column -- must stay last
         })
 
@@ -417,8 +422,6 @@ def parse_demo(demo_path):
                 "score_diff": _signed_diff(ct_score, t_score),
                 "ct_alive": ct_alive,
                 "t_alive": t_alive,
-                "ct_deaths_so_far": max(0, starting_ct_alive - ct_alive),
-                "t_deaths_so_far": max(0, starting_t_alive - t_alive),
                 "alive_diff": ct_alive - t_alive,
                 "ct_equip_value": snap_ct_equip,
                 "t_equip_value": snap_t_equip,
@@ -426,6 +429,7 @@ def parse_demo(demo_path):
                 "ct_avg_health": float(ct.loc[ct["is_alive"] == True, "health"].mean()) if "health" in ct and ct_alive else 0.0,
                 "t_avg_health": float(t.loc[t["is_alive"] == True, "health"].mean()) if "health" in t and t_alive else 0.0,
                 "ct_helmets": int(ct["has_helmet"].sum()) if "has_helmet" in ct else None,
+                "t_helmets": int(t["has_helmet"].sum()) if "has_helmet" in t else None,
                 "ct_defusers": int(ct["has_defuser"].sum()) if "has_defuser" in ct else None,
                 "ct_flashed": int((ct["flash_duration"] > 0).sum()) if "flash_duration" in ct else None,
                 "t_flashed": int((t["flash_duration"] > 0).sum()) if "flash_duration" in t else None,

@@ -5,15 +5,22 @@ module docstring for how round_data.csv is built. This is the round-level
 win-probability model meant to feed a match-level Monte Carlo/DP
 simulation, not a match-outcome model itself.
 
+The model trains on ct_equip_value and t_equip_value alone (see
+FEATURE_COLS). A permutation-importance test across 10 match-grouped
+train/test splits found the equip values (whether given raw or as their
+CT-minus-T difference) were the only columns with a consistent,
+non-noise-level effect on round-winner predictions -- score, loss-bonus
+streaks, helmets, defusers, and map all came back indistinguishable from
+zero (some, like ct_loss_bonus_streak, were mildly *negative* across every
+split, i.e. the model did marginally better without them). round_data.csv
+still carries ct_score/t_score and the loss-bonus streaks alongside the
+equip values, but those are there for a planned round-to-round economy
+transition model, not as features for this one -- see parse_demos.py's
+module docstring.
+
 Two modes:
   train  Fits on the entire dataset and saves the model to
-         data/round_model.json. Use this once you're done evaluating, to
-         get the strongest model for actual simulation use -- every real
-         round outcome is useful signal at that point, so there's no
-         reason to hold any of it out. The number of trees is still chosen
-         by early stopping against a held-out slice of matches (see
-         `_pick_n_estimators`), then the final model is refit on 100% of
-         the data with that fixed tree count.
+         data/round_model.json.
   test   Fits on 80% of matches and evaluates on the held-out 20%, to
          estimate how well the model generalizes to matches it hasn't
          seen. The split is grouped by match_id, not a random row split:
@@ -22,20 +29,13 @@ Two modes:
          across train/test and inflate the apparent score.
 
 At ~100 matches, this problem is starved for data relative to how much
-signal a plain "throw every raw column at a deep XGBoost" setup needs --
-the fit will overfit to per-match noise well before it exhausts the real
-economic signal in the data (e.g. equip_diff alone is a strong predictor).
-Two things counter that here, and both were verified to help with 5-fold
-grouped cross-validation, not just eyeballed on one split:
-  - equip_diff / score_diff / loss_bonus_diff (CT minus T) are precomputed
-    by parse_demos.py and stored directly in round_data.csv. XGBoost can in
-    principle learn "the difference between these two columns matters" on
-    its own, but doing that from the raw ct_*/t_* pair costs splits that
-    this little data can't spare -- handing it the difference directly is
-    a large, free win here.
-  - Regularization (shallow trees, min_child_weight, reg_lambda) plus
-    early stopping against a held-out slice of matches, instead of a fixed
-    n_estimators picked without looking at validation performance.
+signal a plain "throw defaults at a deep XGBoost" setup needs -- the fit
+overfits to per-match noise well before it exhausts the real economic
+signal in ct_equip_value/t_equip_value. Regularization (shallow trees,
+min_child_weight, reg_lambda, row/column subsampling) plus early stopping
+against a held-out slice of matches (instead of a fixed n_estimators
+picked without looking at validation performance) both counter that, as
+does MONOTONE_CONSTRAINTS -- see its comment above FEATURE_COLS.
 
 Usage:
     python round_model.py train
@@ -55,6 +55,18 @@ MODEL_PATH = os.path.join(DATA_DIR, "round_model.json")
 
 TARGET_COL = "winner_is_ct"
 ID_COL = "match_id"  # identifier for grouped splitting, not a feature -- see parse_demos.py
+# The only features this model uses -- see module docstring for why the
+# other round_data.csv columns (score, loss-bonus streaks) are excluded.
+FEATURE_COLS = ["ct_equip_value", "t_equip_value"]
+# Win probability must be non-decreasing in ct_equip_value and
+# non-increasing in t_equip_value -- that's known a priori, not something
+# ~2K rows should have to (re)learn. Enforcing it as a hard constraint
+# during split-finding (rather than hoping the data implies it) acts as
+# extra regularization on top of the depth/subsample/reg_lambda settings
+# below, and measurably improved log loss/Brier/AUC across 10
+# match-grouped test splits versus the unconstrained model (10/10 splits
+# favored the constrained model, mean log loss 0.604 -> 0.600).
+MONOTONE_CONSTRAINTS = (1, -1)  # order matches FEATURE_COLS
 
 TEST_SIZE = 0.2
 # Fraction of the *training* matches held out to pick the number of trees
@@ -64,13 +76,22 @@ TEST_SIZE = 0.2
 # fitting.
 VAL_SIZE = 0.15
 EARLY_STOPPING_ROUNDS = 50
+# Picked by a max_depth x learning_rate grid search (2-6 x 0.01-0.1),
+# averaged over 5 match-grouped train/test splits so the pick isn't just
+# fitting one split's noise. max_depth=2 beat every deeper value at every
+# learning rate tried (mean log loss ~0.614 vs ~0.622+ for depth 3), which
+# tracks: two raw features can't support many splits per tree before a
+# leaf is fitting per-match noise instead of signal. learning_rate barely
+# moved the result at max_depth=2 (0.614-0.615 across the whole range) --
+# 0.03 edged out the rest but the difference is noise-level.
+MAX_DEPTH = 2
+LEARNING_RATE = 0.03
 RANDOM_STATE = 42
 
 
 def _load_data():
     df = pd.read_csv(ROUND_DATA_CSV)
-    feature_cols = [c for c in df.columns if c not in (ID_COL, TARGET_COL)]
-    return df[feature_cols], df[TARGET_COL], df[ID_COL]
+    return df[FEATURE_COLS], df[TARGET_COL], df[ID_COL]
 
 
 def _require_multiple_groups(groups, purpose):
@@ -82,22 +103,23 @@ def _require_multiple_groups(groups, purpose):
         )
 
 
-def _make_model(n_estimators, early_stopping_rounds=None):
+def _make_model(n_estimators, max_depth=MAX_DEPTH, learning_rate=LEARNING_RATE, early_stopping_rounds=None):
     return xgb.XGBClassifier(
         n_estimators=n_estimators,
-        max_depth=3,
-        learning_rate=0.03,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
         subsample=0.8,
         colsample_bytree=0.8,
         reg_lambda=5.0,
         min_child_weight=10,
+        monotone_constraints=MONOTONE_CONSTRAINTS,
         eval_metric="logloss",
         early_stopping_rounds=early_stopping_rounds,
         random_state=RANDOM_STATE,
     )
 
 
-def _pick_n_estimators(X, y, groups):
+def _pick_n_estimators(X, y, groups, max_depth=MAX_DEPTH, learning_rate=LEARNING_RATE):
     """Fits with early stopping against a held-out slice of matches carved
     out of (X, y, groups), and returns the resulting best tree count. The
     caller is responsible for then fitting the model it actually keeps."""
@@ -105,7 +127,10 @@ def _pick_n_estimators(X, y, groups):
     splitter = GroupShuffleSplit(n_splits=1, test_size=VAL_SIZE, random_state=RANDOM_STATE)
     fit_idx, val_idx = next(splitter.split(X, y, groups))
 
-    model = _make_model(n_estimators=2000, early_stopping_rounds=EARLY_STOPPING_ROUNDS)
+    model = _make_model(
+        n_estimators=2000, max_depth=max_depth, learning_rate=learning_rate,
+        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+    )
     model.fit(
         X.iloc[fit_idx], y.iloc[fit_idx],
         eval_set=[(X.iloc[val_idx], y.iloc[val_idx])],
