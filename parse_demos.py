@@ -56,6 +56,20 @@ Re-running this script never reparses a demo it already has rows for, and
 never re-attempts a demo that failed with a permanent (e.g. corrupt-file)
 error -- see `.parsed_demos.json` in the data dir, tracked the same way
 demo_fetcher.py tracks already-downloaded matches.
+
+Round recording stops as soon as a side has already won under CS2's real
+rules (see _match_already_decided) -- confirmed empirically that some
+servers keep playing rounds after a side clinches (one demo in this
+project's own dataset played 8 rounds past a 13-round clinch, ending 20-5
+instead of stopping around 13-4), which would otherwise leak
+non-competitive bonus rounds into both CSVs. This does NOT guard against
+the opposite problem -- a demo whose recording stops early, before either
+side ever reaches a winning score (e.g. a truncated download, or a match
+conceded/abandoned mid-map) -- since there's no way to tell that case
+apart from a real, still-in-progress round from parsing alone; code that
+needs a match's true final winner (e.g. a match-outcome model) should
+check that the match it's reading actually reached a decided state rather
+than assuming the last recorded round always represents one.
 """
 import argparse
 import glob
@@ -183,6 +197,31 @@ def _match_id(demo_file):
     return zlib.crc32(demo_file.encode()) % 1_000_000
 
 
+def _match_already_decided(ct_score, t_score):
+    """Whether a match is already over BEFORE the round about to start,
+    per CS2's actual win conditions: first to 13 in regulation (24-round
+    cap: MR12), then overtime periods of 6 rounds each where the first
+    side to win 4 rounds within the period wins the match (a 3-3 period
+    starts another one). Used to stop recording a demo's rounds once the
+    match is decided.
+
+    This matters because some servers keep playing rounds after a side
+    has already clinched -- confirmed empirically: one demo in this
+    project's dataset continued 8 rounds past a side reaching 13, ending
+    20-5 instead of stopping around 13-4. Those extra rounds are real
+    gameplay but not part of a competitively-decided match, and were
+    quietly corrupting round_data.csv/data.csv with rounds that
+    shouldn't count -- e.g. any code that treats a match's last recorded
+    round as its true, meaningful final score would be wrong for a demo
+    like that."""
+    total = ct_score + t_score
+    if total < 24:
+        return ct_score >= 13 or t_score >= 13
+    period = (total - 24) // 6
+    open_score = 12 + 3 * period
+    return ct_score >= open_score + 4 or t_score >= open_score + 4
+
+
 def _signed_diff(ct_value, t_value):
     """CT-minus-T difference for a paired ct_*/t_* column (e.g.
     ct_equip_value - t_equip_value). A tree-based model can in principle
@@ -202,6 +241,43 @@ def _first_present(df, candidates):
         if c in df.columns:
             return c
     return None
+
+
+def _team_map_from_tick(tick_df):
+    """Maps steamid -> team_num from a tick snapshot, for use as the
+    authoritative team assignment when splitting an earlier snapshot from
+    the same round -- see _split_by_team for why."""
+    if tick_df is None or len(tick_df) == 0:
+        return {}
+    return dict(zip(tick_df["steamid"], tick_df["team_num"]))
+
+
+def _split_by_team(tick_df, team_map):
+    """Splits a tick snapshot into (ct_rows, t_rows) using `team_map`
+    (built by _team_map_from_tick from a *later* tick in the same round,
+    e.g. round_end) as the authoritative team assignment, instead of
+    tick_df's own team_num column.
+
+    Why: at the halftime boundary (and, per CS2's overtime rules, at each
+    overtime period's 3-round midpoint), the CT/T labels swap teams. In
+    ~30% of demos, the engine hasn't applied that swap yet at the exact
+    freeze_end tick sampled for the *next* round's pre-round state --
+    team_num there still reflects the previous round's assignment for a
+    moment, silently mislabeling that round's score, equipment, and
+    loss-bonus values under the wrong side. This was confirmed
+    empirically: for those matches, the real halftime pistol-equipment
+    reset shows up one row later than a naive freeze_end-based read would
+    place it. A player's team assignment can't change again mid-round
+    once it's actually settled, so mapping every row by steamid onto the
+    team_num it holds at round_end -- well after any swap script has had
+    time to run -- is correct regardless of whether this particular
+    round's freeze_end reading was affected. Falls back to tick_df's own
+    team_num (old behavior) when team_map is empty (e.g. round_end state
+    unavailable) or doesn't cover a given steamid."""
+    if not team_map:
+        return tick_df[tick_df["team_num"] == TEAM_CT], tick_df[tick_df["team_num"] == TEAM_T]
+    resolved_team = tick_df["steamid"].map(team_map).fillna(tick_df["team_num"])
+    return tick_df[resolved_team == TEAM_CT], tick_df[resolved_team == TEAM_T]
 
 
 def _is_corrupt_demo_error(exc):
@@ -307,11 +383,13 @@ def parse_demo(demo_path):
             continue
 
         needed_ticks.add(freeze_end_tick)
+        needed_ticks.add(round_end_tick)
         needed_ticks.update(sample_ticks)
 
         round_meta.append({
             "round_num": round_num,
             "freeze_end_tick": freeze_end_tick,
+            "round_end_tick": round_end_tick,
             "winner_side": winner_side,
             "plant_tick": plant_tick,
             "sample_ticks": sample_ticks,
@@ -343,6 +421,7 @@ def parse_demo(demo_path):
     for meta in round_meta:
         round_num = meta["round_num"]
         freeze_end_tick = meta["freeze_end_tick"]
+        round_end_tick = meta["round_end_tick"]
         winner_side = meta["winner_side"]
         plant_tick = meta["plant_tick"]
         sample_ticks = meta["sample_ticks"]
@@ -351,8 +430,12 @@ def parse_demo(demo_path):
         if start_state is None or len(start_state) == 0:
             continue
 
-        ct0 = start_state[start_state["team_num"] == TEAM_CT]
-        t0 = start_state[start_state["team_num"] == TEAM_T]
+        # Authoritative team assignment for this round, sourced from
+        # round_end (well after any halftime/OT side-swap script has run)
+        # rather than trusted from start_state's own team_num -- see
+        # _split_by_team.
+        team_map = _team_map_from_tick(ticks_by_tick.get(round_end_tick))
+        ct0, t0 = _split_by_team(start_state, team_map)
 
         ct_clan = t_clan = None
         if have_clan_name:
@@ -365,6 +448,13 @@ def parse_demo(demo_path):
             t_score = team_wins.get(t_clan, 0)
         else:
             ct_score, t_score = ct_score_fallback, t_score_fallback
+
+        if _match_already_decided(ct_score, t_score):
+            # The match was already won before this round started -- any
+            # further rounds are bonus/practice rounds some servers keep
+            # playing, not part of a real, competitively-decided match.
+            # Stop recording this demo here rather than let them leak in.
+            break
 
         # One row per round for round_data.csv, taken at the freezetime-end
         # instant itself. Trimmed to just what round_model.py trains on
@@ -399,8 +489,7 @@ def parse_demo(demo_path):
             if snap is None or len(snap) == 0:
                 continue
 
-            ct = snap[snap["team_num"] == TEAM_CT]
-            t = snap[snap["team_num"] == TEAM_T]
+            ct, t = _split_by_team(snap, team_map)
 
             ct_alive = int(ct["is_alive"].sum()) if "is_alive" in ct else len(ct)
             t_alive = int(t["is_alive"].sum()) if "is_alive" in t else len(t)

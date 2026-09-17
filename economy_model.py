@@ -137,9 +137,16 @@ def _perspective_frame(df, next_df, own_prefix, opp_prefix, own_win_prob):
     return frame[valid]
 
 
-def _load_data():
+def _load_data(round_clf=None):
+    """round_clf lets a caller (match_model.py's test mode) supply an
+    already-fitted round-winner classifier instead of loading
+    round_model.json from disk -- needed so its match-grouped test split
+    can fit round_model on the train matches only and feed that (not the
+    full-data model, which would leak the held-out matches' own outcomes
+    into this model's ct_win_prob feature) into economy_model's own
+    training data."""
     df = pd.read_csv(ROUND_DATA_CSV)
-    rmodel = _load_round_model()
+    rmodel = round_clf if round_clf is not None else _load_round_model()
     ct_win_prob = rmodel.predict_proba(df[round_model.FEATURE_COLS])[:, 1]
 
     next_df = df.groupby(ID_COL).shift(-1)
