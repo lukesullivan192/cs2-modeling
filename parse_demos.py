@@ -1,14 +1,24 @@
 """
-Parses CS2 .dem files into mid-round game-state snapshots for round-outcome
-modeling, and writes them to ./data/data.csv.
+Parses CS2 .dem files into two training sets and writes them to ./data/:
 
-One output row = one sampled point in time during a live round (after
-freezetime ends, before the round ends), labeled with that round's eventual
-winner. This is the shape a "given the state right now, who wins the round"
-model needs -- as opposed to one row per round or one row per kill.
+- data.csv: mid-round game-state snapshots for a "live" round-outcome model.
+  One output row = one sampled point in time during a live round (after
+  freezetime ends, before the round ends), labeled with that round's eventual
+  winner. This is the shape a "given the state right now, who wins the
+  round" model needs -- as opposed to one row per round or one row per kill.
 
-Every column in data.csv is numeric so the file can be fed straight into a
-model: X = df.iloc[:, :-1], y = df.iloc[:, -1]. The last column,
+- round_data.csv: one row per round, taken at the instant freezetime ends
+  (before anyone can move, buy, or take damage). This is the shape a
+  "forecast a round that hasn't been played yet" model needs, for chaining
+  round predictions into a match-level Monte Carlo/DP simulation: at
+  simulation time you only ever have pre-round information (score,
+  economy, loss bonus) to condition on, so columns that are always
+  constant/uninformative at that instant -- alive counts, deaths-so-far,
+  health, flash state, bomb state, elapsed time -- are dropped rather than
+  carried over from data.csv's schema.
+
+Every column in both CSVs is numeric so the files can be fed straight into
+a model: X = df.iloc[:, :-1], y = df.iloc[:, -1]. The last column,
 winner_is_ct, is a 0/1 label -- this is a binary classification problem
 (predict which side wins the round from its current state), not a
 regression one, so pick a classifier (e.g. logistic regression / gradient
@@ -46,6 +56,7 @@ from demoparser2 import DemoParser
 DEMOS_DIR = "demos"
 DATA_DIR = "data"
 OUTPUT_CSV = os.path.join(DATA_DIR, "data.csv")
+ROUND_OUTPUT_CSV = os.path.join(DATA_DIR, "round_data.csv")
 TRACKING_FILE = os.path.join(DATA_DIR, ".parsed_demos.json")
 
 # How often (in seconds of game time) to sample state during a live round.
@@ -178,7 +189,10 @@ def _is_corrupt_demo_error(exc):
 
 
 def parse_demo(demo_path):
-    """Returns a list of row dicts, one per mid-round snapshot, for a single demo."""
+    """Returns (rows, round_rows) for a single demo: `rows` is a list of row
+    dicts, one per mid-round snapshot (for data.csv); `round_rows` is a list
+    of row dicts, one per round, taken at freezetime-end (for
+    round_data.csv)."""
     print(f"Parsing {demo_path}...")
     parser = DemoParser(demo_path)
     demo_file = os.path.basename(demo_path)
@@ -193,12 +207,12 @@ def parse_demo(demo_path):
 
     if round_ends is None or len(round_ends) == 0:
         print(f"  No round_end events found in {demo_file}, skipping.")
-        return []
+        return [], []
 
     winner_col = _first_present(round_ends, ["winner", "winner_side", "team"])
     if winner_col is None:
         print(f"  Could not find a winner column in round_end events for {demo_file}, skipping.")
-        return []
+        return [], []
     # demoparser2's round_end carries the server's own gapless round counter
     # (1-based; round 0 is a pre-game/warmup artifact, filtered out below by
     # the degenerate-round check). Prefer it over our own row position:
@@ -276,7 +290,7 @@ def parse_demo(demo_path):
         })
 
     if not round_meta:
-        return []
+        return [], []
 
     # --- Pass 2: fetch every round's player state in ONE parse_ticks call.
     # demoparser2 re-scans the whole demo stream from the start on every
@@ -288,11 +302,12 @@ def parse_demo(demo_path):
         all_ticks_df = parser.parse_ticks(tick_props, ticks=sorted(needed_ticks))
     except Exception as e:
         print(f"  Could not read tick state for {demo_file}: {e}")
-        return []
+        return [], []
 
     ticks_by_tick = {tick: snap for tick, snap in all_ticks_df.groupby("tick")}
 
     rows = []
+    round_rows = []
     team_wins = {}  # clan_name -> cumulative rounds won so far (only used if clan names are available)
     ct_score_fallback = 0
     t_score_fallback = 0
@@ -308,12 +323,13 @@ def parse_demo(demo_path):
         if start_state is None or len(start_state) == 0:
             continue
 
+        ct0 = start_state[start_state["team_num"] == TEAM_CT]
+        t0 = start_state[start_state["team_num"] == TEAM_T]
+
         ct_clan = t_clan = None
         if have_clan_name:
-            ct_rows = start_state[start_state["team_num"] == TEAM_CT]
-            t_rows = start_state[start_state["team_num"] == TEAM_T]
-            ct_clan = ct_rows["team_clan_name"].iloc[0] if len(ct_rows) else None
-            t_clan = t_rows["team_clan_name"].iloc[0] if len(t_rows) else None
+            ct_clan = ct0["team_clan_name"].iloc[0] if len(ct0) else None
+            t_clan = t0["team_clan_name"].iloc[0] if len(t0) else None
 
         # Score entering this round.
         if have_clan_name and ct_clan is not None and t_clan is not None:
@@ -324,6 +340,27 @@ def parse_demo(demo_path):
 
         starting_ct_alive = int((start_state["team_num"] == TEAM_CT).sum())
         starting_t_alive = int((start_state["team_num"] == TEAM_T).sum())
+
+        # One row per round for round_data.csv, taken at the freezetime-end
+        # instant itself: equipment is locked in, nobody's moved or taken
+        # damage yet, so alive counts/deaths/health/flash/bomb state are all
+        # fixed, uninformative values (5v5, 0, 100, 0, unplanted) -- those
+        # columns are dropped here rather than carried over from data.csv's
+        # schema. See module docstring.
+        round_rows.append({
+            "match_id": _match_id(demo_file),
+            "map_name": _map_name_to_id(map_name),
+            "round_num": round_num,
+            "ct_score": ct_score,
+            "t_score": t_score,
+            "ct_equip_value": int(ct0["current_equip_value"].sum()) if "current_equip_value" in ct0 else None,
+            "t_equip_value": int(t0["current_equip_value"].sum()) if "current_equip_value" in t0 else None,
+            "ct_helmets": int(ct0["has_helmet"].sum()) if "has_helmet" in ct0 else None,
+            "ct_defusers": int(ct0["has_defuser"].sum()) if "has_defuser" in ct0 else None,
+            "ct_loss_bonus_streak": int(ct0["ct_losing_streak"].iloc[0]) if "ct_losing_streak" in ct0 and len(ct0) else None,
+            "t_loss_bonus_streak": int(t0["t_losing_streak"].iloc[0]) if "t_losing_streak" in t0 and len(t0) else None,
+            "winner_is_ct": int(winner_side == TEAM_CT),  # target column -- must stay last
+        })
 
         for snap_tick in sample_ticks:
             snap = ticks_by_tick.get(snap_tick)
@@ -385,7 +422,7 @@ def parse_demo(demo_path):
             else:
                 t_score_fallback += 1
 
-    return rows
+    return rows, round_rows
 
 
 def _safe_parse_event(parser, event_name):
@@ -432,27 +469,27 @@ def _save_tracking(parsed_match_ids, failed_match_ids):
         }, f, indent=2)
 
 
-def _append_rows_to_csv(rows):
+def _append_rows_to_csv(rows, csv_path):
     if not rows:
         return
-    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
-    write_header = not os.path.exists(OUTPUT_CSV)
-    pd.DataFrame(rows).to_csv(OUTPUT_CSV, mode="a", header=write_header, index=False)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    write_header = not os.path.exists(csv_path)
+    pd.DataFrame(rows).to_csv(csv_path, mode="a", header=write_header, index=False)
 
 
-def _discard_rows_for_match_ids(match_ids):
-    """Remove any already-written rows for `match_ids` from OUTPUT_CSV.
+def _discard_rows_for_match_ids(match_ids, csv_path):
+    """Remove any already-written rows for `match_ids` from `csv_path`.
     Used when a match turns out to belong to a multi-part recording whose
     other part failed to parse, after some of its rows were already
     appended -- see `_fail_incomplete_series`."""
-    if not match_ids or not os.path.exists(OUTPUT_CSV):
+    if not match_ids or not os.path.exists(csv_path):
         return
-    df = pd.read_csv(OUTPUT_CSV)
+    df = pd.read_csv(csv_path)
     kept = df[~df["match_id"].isin(match_ids)]
     removed = len(df) - len(kept)
     if removed:
-        kept.to_csv(OUTPUT_CSV, index=False)
-        print(f"  Discarded {removed} previously-written row(s) for match_id(s) {sorted(match_ids)} from {OUTPUT_CSV}.")
+        kept.to_csv(csv_path, index=False)
+        print(f"  Discarded {removed} previously-written row(s) for match_id(s) {sorted(match_ids)} from {csv_path}.")
 
 
 def _series_key(demo_file):
@@ -536,10 +573,12 @@ def main():
     if not args.force:
         newly_failed = _fail_incomplete_series(series_map, parsed_match_ids, failed_match_ids)
         if newly_failed:
-            _discard_rows_for_match_ids(newly_failed)
+            _discard_rows_for_match_ids(newly_failed, OUTPUT_CSV)
+            _discard_rows_for_match_ids(newly_failed, ROUND_OUTPUT_CSV)
             _save_tracking(parsed_match_ids, failed_match_ids)
 
     total_rows = 0
+    total_round_rows = 0
     demos_parsed_this_run = 0
     demos_skipped = 0
 
@@ -556,7 +595,7 @@ def main():
             continue
 
         try:
-            rows = parse_demo(demo_path)
+            rows, round_rows = parse_demo(demo_path)
         except Exception as e:
             if _is_corrupt_demo_error(e):
                 print(f"Failed to parse {demo_path}: file appears corrupt/truncated ({e}). "
@@ -565,14 +604,16 @@ def main():
                 print(f"Failed to parse {demo_path}: {e}")
             failed_match_ids[match_id] = str(e)
         else:
-            _append_rows_to_csv(rows)
+            _append_rows_to_csv(rows, OUTPUT_CSV)
+            _append_rows_to_csv(round_rows, ROUND_OUTPUT_CSV)
             total_rows += len(rows)
+            total_round_rows += len(round_rows)
             demos_parsed_this_run += 1
 
             parsed_match_ids.add(match_id)
             failed_match_ids.pop(match_id, None)
 
-            print(f"  Wrote {len(rows)} row(s) from {demo_file}.")
+            print(f"  Wrote {len(rows)} row(s) to {OUTPUT_CSV} and {len(round_rows)} row(s) to {ROUND_OUTPUT_CSV} from {demo_file}.")
 
         # Re-check series consistency after every demo (success or failure):
         # a sibling part may have failed earlier in this same run after this
@@ -582,12 +623,14 @@ def main():
         # case, not just when the failure happens to come first.
         newly_failed = _fail_incomplete_series(series_map, parsed_match_ids, failed_match_ids)
         if newly_failed:
-            _discard_rows_for_match_ids(newly_failed)
+            _discard_rows_for_match_ids(newly_failed, OUTPUT_CSV)
+            _discard_rows_for_match_ids(newly_failed, ROUND_OUTPUT_CSV)
         _save_tracking(parsed_match_ids, failed_match_ids)
 
     print(
         f"\nParsed {demos_parsed_this_run} demo(s) this run "
-        f"({total_rows} new row(s) appended to {OUTPUT_CSV}), "
+        f"({total_rows} new row(s) appended to {OUTPUT_CSV}, "
+        f"{total_round_rows} new row(s) appended to {ROUND_OUTPUT_CSV}), "
         f"skipped {demos_skipped} already-tracked demo(s)."
     )
     if failed_match_ids:
