@@ -19,7 +19,7 @@ is expanded into two perspective rows -- one from the CT side's point of
 view, one from T's -- with columns renamed to own_equip_value /
 opp_equip_value / own_loss_bonus_streak / own_win_prob, and a single
 model is fit on the result. This doubles the training data for free
-(same trick round_model.py's docstring notes this project can't afford
+(same trick run_round_model.py's docstring notes this project can't afford
 to skip, given how few matches there are) and encodes, structurally, the
 fact that "next round's equip" should depend on being the own side vs.
 the opponent, not on being labeled CT vs. T.
@@ -47,7 +47,7 @@ Two modes:
   train  Fits on the entire dataset and saves the model to
          models/saves/economy_model.json.
   test   Fits on 80% of matches and evaluates MAE/RMSE on the held-out
-         20%, match-grouped the same way round_model.py's test mode is
+         20%, match-grouped the same way run_round_model.py's test mode is
          (see its docstring for why a row-level split would leak).
 
 Also usable as a library: predict_next_equip_values() takes a round's
@@ -57,9 +57,9 @@ this is the piece a round-to-round match simulation would call each
 simulated round.
 
 Usage:
-    python economy_model.py train
-    python economy_model.py test
-    python economy_model.py predict --ct-equip 4200 --t-equip 4200 \
+    python run_economy_model.py train
+    python run_economy_model.py test
+    python run_economy_model.py predict --ct-equip 4200 --t-equip 4200 \
         --ct-streak 1 --t-streak 1 --ct-win-prob 0.55
 """
 import argparse
@@ -71,7 +71,7 @@ import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import GroupShuffleSplit
 
-import round_model
+import run_round_model as round_model
 
 DATA_DIR = "data"
 ROUND_DATA_CSV = os.path.join(DATA_DIR, "round_data.csv")
@@ -99,13 +99,13 @@ VAL_SIZE = 0.15
 EARLY_STOPPING_ROUNDS = 50
 # Picked by a max_depth x learning_rate grid search (2-6 x 0.01-0.1),
 # averaged over 5 match-grouped train/test splits -- same protocol as
-# round_model.py's search, but the result runs the other way: MAE dropped
+# run_round_model.py's search, but the result runs the other way: MAE dropped
 # steadily from depth 2 to depth 4 (mean ~5232 -> ~5130) instead of
 # favoring the shallowest tree, then flattened through depth 6 (~5121-5130,
 # a noise-level spread). Four features evidently support more splits per
-# tree here than round_model.py's two before a leaf starts fitting
+# tree here than run_round_model.py's two before a leaf starts fitting
 # per-match noise. learning_rate moved the result about as little as it
-# did for round_model.py; 0.03 was consistently near the best of the range
+# did for run_round_model.py; 0.03 was consistently near the best of the range
 # tried at every depth.
 MAX_DEPTH = 4
 LEARNING_RATE = 0.03
@@ -115,7 +115,7 @@ RANDOM_STATE = 42
 def _load_round_model():
     if not os.path.exists(round_model.MODEL_PATH):
         raise SystemExit(
-            f"{round_model.MODEL_PATH} not found -- run `python round_model.py train` first."
+            f"{round_model.MODEL_PATH} not found -- run `python run_round_model.py train` first."
         )
     model = xgb.XGBClassifier()
     model.load_model(round_model.MODEL_PATH)
@@ -139,7 +139,7 @@ def _perspective_frame(df, next_df, own_prefix, opp_prefix, own_win_prob):
 
 
 def _load_data(round_clf=None):
-    """round_clf lets a caller (match_model.py's test mode) supply an
+    """round_clf lets a caller (run_match_model.py's test mode) supply an
     already-fitted round-winner classifier instead of loading
     round_model.json from disk -- needed so its match-grouped test split
     can fit round_model on the train matches only and feed that (not the
@@ -222,7 +222,7 @@ def run_test(X, y, groups):
     rmse = mean_squared_error(y_test, preds) ** 0.5
 
     # Naive baseline: assume next round's equip equals this round's --
-    # the same role round_model.py's majority-class baseline plays, so the
+    # the same role run_round_model.py's majority-class baseline plays, so the
     # model's error is judged against "predicting nothing changed" rather
     # than against zero.
     baseline_preds = X_test["own_equip_value"]
@@ -247,7 +247,7 @@ def run_train(X, y, groups):
 
 def _load_economy_model():
     if not os.path.exists(MODEL_PATH):
-        raise SystemExit(f"{MODEL_PATH} not found -- run `python economy_model.py train` first.")
+        raise SystemExit(f"{MODEL_PATH} not found -- run `python run_economy_model.py train` first.")
     model = xgb.XGBRegressor()
     model.load_model(MODEL_PATH)
     return model

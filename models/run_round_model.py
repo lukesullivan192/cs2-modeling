@@ -38,8 +38,8 @@ picked without looking at validation performance) both counter that, as
 does MONOTONE_CONSTRAINTS -- see its comment above FEATURE_COLS.
 
 Usage:
-    python round_model.py train
-    python round_model.py test
+    python run_round_model.py train
+    python run_round_model.py test
 """
 import argparse
 import os

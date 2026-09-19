@@ -33,39 +33,41 @@ pip install -r requirements.txt
    re-attempt demos that previously failed, or `--force` to reparse
    everything.
 
-3. Train/evaluate the round-winner model:
+3. Evaluate the match-outcome dynamic program:
    ```bash
-   python models/round_model.py train   # fits on all data, saves models/saves/round_model.json
-   python models/round_model.py test    # match-grouped 80/20 train/test MAE/log-loss report
+   python models/run_match_model.py train   # ensures round_model.json/economy_model.json exist in models/saves/
+   python models/run_match_model.py test    # match-level accuracy, broken down by round number
    ```
-   An XGBoost classifier predicting P(CT wins) a round from each side's
-   equipment value entering it.
+   Chains `run_round_model` and `run_economy_model` into a full match
+   simulation: from any round's pre-round state, it branches on who wins
+   each remaining round, applies CS2's actual scoring/halftime/overtime
+   rules to fill in the rest of the state, and computes P(CT wins the
+   match). `test` runs this from every real round of the held-out matches
+   and reports how accurate the resulting match-winner prediction is at
+   each round number, plus one overall average, against a naive
+   "whoever's-currently-leading" baseline. `train` trains both of the
+   pieces below on the full dataset; running them on their own is only
+   needed to evaluate one in isolation:
 
-4. Train/evaluate the round-to-round economy model:
-   ```bash
-   python models/economy_model.py train
-   python models/economy_model.py test
-   ```
-   An XGBoost regressor predicting each side's next-round equipment value
-   from its current economy state and `round_model`'s win probability for
-   the round in between -- the piece a round-to-round match simulation
-   would call each simulated round.
+   - Train/evaluate the round-winner model on its own:
+     ```bash
+     python models/run_round_model.py train   # fits on all data, saves models/saves/round_model.json
+     python models/run_round_model.py test    # match-grouped 80/20 train/test MAE/log-loss report
+     ```
+     An XGBoost classifier predicting P(CT wins) a round from each side's
+     equipment value entering it.
 
-5. Evaluate the match-outcome dynamic program:
-   ```bash
-   python models/match_model.py train   # ensures round_model.json/economy_model.json exist in models/saves/
-   python models/match_model.py test    # match-level accuracy, broken down by round number
-   ```
-   Chains `round_model` and `economy_model` into a full match simulation:
-   from any round's pre-round state, it branches on who wins each
-   remaining round, applies CS2's actual scoring/halftime/overtime rules
-   to fill in the rest of the state, and computes P(CT wins the match).
-   `test` runs this from every real round of the held-out matches and
-   reports how accurate the resulting match-winner prediction is at each
-   round number, plus one overall average, against a naive
-   "whoever's-currently-leading" baseline.
+   - Train/evaluate the round-to-round economy model on its own:
+     ```bash
+     python models/run_economy_model.py train
+     python models/run_economy_model.py test
+     ```
+     An XGBoost regressor predicting each side's next-round equipment
+     value from its current economy state and `run_round_model`'s win
+     probability for the round in between -- the piece a round-to-round
+     match simulation would call each simulated round.
 
-6. Run the trained models live against an in-progress HLTV match:
+4. Run the trained models live against an in-progress HLTV match:
    ```bash
    python live/run_live_model.py <hltv_match_url_or_id>
    ```
@@ -73,8 +75,8 @@ pip install -r requirements.txt
    Prints each round's pre-round state and `P(CT wins the match)` once
    per round, as soon as `parse_live_round.py` finds that round's state
    (the gamestate right after freeze time ends), updating live as the
-   match is played. Trains `round_model`/`economy_model` first (same as
-   step 3-5's `train` modes) if
+   match is played. Trains `run_round_model`/`run_economy_model` first
+   (same as step 3's `train` modes) if
    `models/saves/round_model.json`/`economy_model.json` don't exist yet;
    otherwise loads them as-is.
 
@@ -87,9 +89,10 @@ pip install -r requirements.txt
    - `parse_live_round.py`: turns that raw feed into one row per round in
      `round_data.csv`'s exact shape (`match_id`, `round_num`, `ct_score`,
      `t_score`, `ct_equip_value`, `t_equip_value`,
-     `ct_loss_bonus_streak`, `t_loss_bonus_streak`), tracking each
-     round's state until its first kill locks it in as "the instant
-     freeze time ends" (`python live/parse_live_round.py <match>` prints
-     just this, with no model involved).
+     `ct_loss_bonus_streak`, `t_loss_bonus_streak`), tracking each round's
+     state until the round's equip values settle (or its first kill,
+     whichever comes first) locks it in as "the instant freeze time
+     ends" (`python live/parse_live_round.py <match>` prints just this,
+     with no model involved).
    - `run_live_model.py`: feeds each new round straight into
-     `MatchSimulator.p_ct_wins_match()` from step 5.
+     `MatchSimulator.p_ct_wins_match()` from step 3.

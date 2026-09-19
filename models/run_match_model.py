@@ -1,6 +1,6 @@
 """
-Chains round_model.py (P(CT wins) the upcoming round from its equip
-values) and economy_model.py (each side's forecast equip value entering
+Chains run_round_model.py (P(CT wins) the upcoming round from its equip
+values) and run_economy_model.py (each side's forecast equip value entering
 the *next* round) into a full match-outcome dynamic program: starting
 from any round's pre-round state, it branches on who wins that round,
 deterministically fills in the rest of the resulting next-round state
@@ -29,7 +29,7 @@ empirically against round_data.csv rather than assumed:
     rounds after that (24, 30, 36, ... rounds decided); the first side to
     win 4 rounds *within* a period wins the match, and a 3-3 period
     starts another one. Loss-bonus streaks reset to 1/1 at the start of
-    each period (confirmed in economy_model.py's docstring); the sides
+    each period (confirmed in run_economy_model.py's docstring); the sides
     swap again at each period's midpoint (3 rounds in), the same
     label-swap (not reset) treatment as halftime. Equipment is NOT
     force-reset in OT -- economy_model was deliberately trained on those
@@ -79,8 +79,8 @@ Two modes:
          round_model.run_train / economy_model.run_train) -- the DP
          itself has no parameters of its own to fit; it's a fixed
          function of those two models plus CS2's deterministic rules.
-  test   Uses the same match-grouped 80/20 split round_model.py and
-         economy_model.py use (same TEST_SIZE/RANDOM_STATE), but refits
+  test   Uses the same match-grouped 80/20 split run_round_model.py and
+         run_economy_model.py use (same TEST_SIZE/RANDOM_STATE), but refits
          both models on the 80% train matches only -- reusing the
          full-data models here would leak each held-out match's own
          outcome into the very predictions being evaluated on it. Then,
@@ -95,8 +95,8 @@ Two modes:
          plays.
 
 Usage:
-    python match_model.py train
-    python match_model.py test
+    python run_match_model.py train
+    python run_match_model.py test
 """
 import argparse
 import os
@@ -106,8 +106,8 @@ from collections import defaultdict, namedtuple
 import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 
-import economy_model
-import round_model
+import run_economy_model as economy_model
+import run_round_model as round_model
 
 DATA_DIR = "data"
 ROUND_DATA_CSV = os.path.join(DATA_DIR, "round_data.csv")
@@ -129,7 +129,7 @@ HALFTIME_T_EQUIP = 4350.0
 
 # Quantization step (dollars) for DP memoization keys only -- doesn't
 # affect the actual value fed to either model. XGBoost's predictions are
-# piecewise-constant over fairly wide regions (round_model.py's trees are
+# piecewise-constant over fairly wide regions (run_round_model.py's trees are
 # only depth 2), so this is a safe, cheap way to collapse many
 # near-identical hypothetical branches into one memoized evaluation.
 EQUIP_ROUND_TO = 100
@@ -431,7 +431,7 @@ def run_train():
 
     print(
         "\nBoth models trained. match_model has no parameters of its own -- "
-        "run `python match_model.py test` to evaluate the resulting match-level DP."
+        "run `python run_match_model.py test` to evaluate the resulting match-level DP."
     )
 
 
@@ -442,7 +442,7 @@ def run_test():
     df = pd.read_csv(ROUND_DATA_CSV)
     round_model._require_multiple_groups(df[ID_COL], "a match-grouped test split")
 
-    # Same split round_model.py/economy_model.py use (same TEST_SIZE/
+    # Same split run_round_model.py/run_economy_model.py use (same TEST_SIZE/
     # RANDOM_STATE, same row order from the same CSV) so "held-out match"
     # means the same thing everywhere.
     splitter = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)

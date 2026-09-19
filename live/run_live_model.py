@@ -1,6 +1,6 @@
-"""Runs models/match_model.py's match-winner DP live against one HLTV
+"""Runs models/run_match_model.py's match-winner DP live against one HLTV
 match: streams live/parse_live_round.py's round-by-round state and
-prints models/match_model.py's P(CT wins the match) once per round, as
+prints models/run_match_model.py's P(CT wins the match) once per round, as
 soon as parse_live_round.py locks in that round's state (the gamestate
 right after freeze time ends).
 
@@ -10,11 +10,11 @@ Usage: python live/run_live_model.py <hltv_match_url_or_id>
     python live/run_live_model.py 2398160
 
 Must be run from the repo root (models/saves/*.json are loaded/saved by
-path relative to cwd, same as models/match_model.py itself expects).
+path relative to cwd, same as models/run_match_model.py itself expects).
 
 If models/saves/round_model.json and models/saves/economy_model.json
 already exist, they're loaded as-is. Otherwise this trains both first (the
-same as running `python models/match_model.py train`), which needs
+same as running `python models/run_match_model.py train`), which needs
 data/round_data.csv (i.e. parse_demos.py must have already been run).
 """
 import argparse
@@ -31,13 +31,13 @@ except ImportError:
 
 def load_simulator():
     """Ensures a trained round_model/economy_model exist (training both, via
-    models/match_model.py's train mode, if either is missing) and returns a
-    ready models/match_model.py MatchSimulator."""
+    models/run_match_model.py's train mode, if either is missing) and returns a
+    ready models/run_match_model.py MatchSimulator."""
     if MODELS_DIR not in sys.path:
         sys.path.insert(0, MODELS_DIR)
-    import economy_model
-    import match_model
-    import round_model
+    import run_economy_model as economy_model
+    import run_match_model as match_model
+    import run_round_model as round_model
 
     if not os.path.exists(round_model.MODEL_PATH) or not os.path.exists(economy_model.MODEL_PATH):
         print("No saved round_model/economy_model found -- training both on the full dataset...")

@@ -2,7 +2,7 @@
 for each round of a live HLTV match, extracts match_id, round_num,
 ct_score, t_score, ct_equip_value, t_equip_value, ct_loss_bonus_streak,
 t_loss_bonus_streak -- the exact pre-round state
-models/match_model.py's MatchSimulator.p_ct_wins_match() takes -- so a live
+models/run_match_model.py's MatchSimulator.p_ct_wins_match() takes -- so a live
 round's state can be fed straight into the match-winner DP. See
 live/run_live_model.py to do that live, round by round.
 
@@ -46,7 +46,7 @@ firstHalf + secondHalf, concatenated in chronological order) is: a side's
 current loss-bonus streak is the number of trailing "lost" entries in its
 own history. HLTV's backend already re-attributes that history to the
 correct physical team across halftime's CT/T label swap, the same
-team-not-label tracking models/match_model.py's DP applies manually via
+team-not-label tracking models/run_match_model.py's DP applies manually via
 CS2's known rules.
 """
 import argparse
@@ -110,7 +110,7 @@ def _extract_round_state(data, match_id, locked):
 
 def fetch_live_round_state(match: str, rounds: int = 0, verbose: bool = True):
     """Yields, once per scorebot tick, either the current round's pre-round
-    state (ready for models/match_model.py's MatchSimulator -- see
+    state (ready for models/run_match_model.py's MatchSimulator -- see
     live/run_live_model.py) or None while the match is between rounds.
 
     match: HLTV match URL or numeric match id.
