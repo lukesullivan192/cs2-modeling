@@ -45,8 +45,6 @@ pip install -r requirements.txt
    ```bash
    python models/economy_model.py train
    python models/economy_model.py test
-   python models/economy_model.py predict --ct-equip 4200 --t-equip 4200 \
-       --ct-streak 1 --t-streak 1 --ct-win-prob 0.55
    ```
    An XGBoost regressor predicting each side's next-round equipment value
    from its current economy state and `round_model`'s win probability for
@@ -69,14 +67,16 @@ pip install -r requirements.txt
 
 6. Run the trained models live against an in-progress HLTV match:
    ```bash
-   python live/run_match_model.py <hltv_match_url_or_id>
+   python live/run_live_model.py <hltv_match_url_or_id>
    ```
-   e.g. `python live/run_match_model.py 2398160` or a full match URL.
-   Prints each round's pre-round state and `P(CT wins the match)` as soon
-   as it's available, updating live as the match is played. Trains
-   `round_model`/`economy_model` first (same as step 3-5's `train` modes)
-   if `models/saves/round_model.json`/`economy_model.json` don't exist
-   yet; otherwise loads them as-is.
+   e.g. `python live/run_live_model.py 2398160` or a full match URL.
+   Prints each round's pre-round state and `P(CT wins the match)` once
+   per round, as soon as `parse_live_round.py` finds that round's state
+   (the gamestate right after freeze time ends), updating live as the
+   match is played. Trains `round_model`/`economy_model` first (same as
+   step 3-5's `train` modes) if
+   `models/saves/round_model.json`/`economy_model.json` don't exist yet;
+   otherwise loads them as-is.
 
    This chains three pieces under `live/`, each usable on its own too:
    - `fetch_live_match.py`: opens the match page in a real,
@@ -91,5 +91,5 @@ pip install -r requirements.txt
      round's state until its first kill locks it in as "the instant
      freeze time ends" (`python live/parse_live_round.py <match>` prints
      just this, with no model involved).
-   - `run_match_model.py`: feeds each parsed round straight into
+   - `run_live_model.py`: feeds each new round straight into
      `MatchSimulator.p_ct_wins_match()` from step 5.

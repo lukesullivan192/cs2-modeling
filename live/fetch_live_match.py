@@ -94,7 +94,7 @@ def find_browser_and_driver() -> tuple:
     return browser, driver
 
 
-def fetch_live_match(match: str, rounds: int = 0, verbose: bool = True):
+def fetch_live_match(match: str, rounds: int = 0):
     """Yields {"ts", "event", "data"} dicts for one live HLTV match's scorebot feed.
 
     match: HLTV match URL or numeric match id.
@@ -104,22 +104,14 @@ def fetch_live_match(match: str, rounds: int = 0, verbose: bool = True):
     browser, driver_path = find_browser_and_driver()
     state = {"backlog_seen": False, "rounds_done": 0}
 
-    if verbose:
-        print(f"launching browser ({browser})...")
     driver = uc.Chrome(driver_executable_path=driver_path, browser_executable_path=browser, headless=True)
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": CAPTURE_JS})
     try:
-        if verbose:
-            print(f"opening {url}")
         driver.get(url)
         time.sleep(6)   # let the Cloudflare challenge clear and the page's own socket connect
-        if verbose:
-            print("TITLE:", driver.title)
 
         while True:
             if driver.service.process.poll() is not None:
-                if verbose:
-                    print("browser process died, stopping", flush=True)
                 return
             time.sleep(POLL_INTERVAL)
             events = driver.execute_script("var e = window.__scorebotEvents; window.__scorebotEvents = []; return e;") or []
@@ -132,21 +124,11 @@ def fetch_live_match(match: str, rounds: int = 0, verbose: bool = True):
                 if name == "log":
                     if not state["backlog_seen"]:
                         state["backlog_seen"] = True   # match history, not live; skip it
-                        if verbose:
-                            print(f"skipped history log ({len(data.get('log', []))} events)", flush=True)
                         continue
                     round_names = [n for e2 in data.get("log", []) for n in e2]
-                    if verbose:
-                        print("log", round_names, flush=True)
                     state["rounds_done"] += round_names.count("RoundEnd")
-                elif name == "scoreboard" and verbose:
-                    print(f"scoreboard {data.get('ctTeamName')} {data.get('counterTerroristScore')} - "
-                          f"{data.get('terroristScore')} {data.get('terroristTeamName')} | round {data.get('currentRound')} "
-                          f"{data.get('currentRoundState')}", flush=True)
                 yield {"ts": ev.get("ts", time.time()), "event": name, "data": data}
                 if rounds and state["rounds_done"] >= rounds:
-                    if verbose:
-                        print(f"{state['rounds_done']} rounds recorded, stopping", flush=True)
                     return
     finally:
         try:
@@ -161,14 +143,11 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=0, help="stop after N RoundEnd events (default: run until Ctrl+C)")
     args = ap.parse_args()
 
-    count = 0
     try:
         for _event in fetch_live_match(args.match, rounds=args.rounds):
-            count += 1
+            pass
     except KeyboardInterrupt:
         pass
-    finally:
-        print(f"\n{count} events captured")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 """Runs models/match_model.py's match-winner DP live against one HLTV
 match: streams live/parse_live_round.py's round-by-round state and
-prints models/match_model.py's P(CT wins the match) as each round's state
-becomes available.
+prints models/match_model.py's P(CT wins the match) once per round, as
+soon as parse_live_round.py locks in that round's state (the gamestate
+right after freeze time ends).
 
-Usage: python live/run_match_model.py <hltv_match_url_or_id>
+Usage: python live/run_live_model.py <hltv_match_url_or_id>
 
-    python live/run_match_model.py https://www.hltv.org/matches/2398160/saw-youngsters-vs-revenix-hyperx-retake-season-12
-    python live/run_match_model.py 2398160
+    python live/run_live_model.py https://www.hltv.org/matches/2398160/saw-youngsters-vs-revenix-hyperx-retake-season-12
+    python live/run_live_model.py 2398160
 
 Must be run from the repo root (models/saves/*.json are loaded/saved by
 path relative to cwd, same as models/match_model.py itself expects).
@@ -65,7 +66,7 @@ def main() -> None:
 
     simulator = load_simulator()
 
-    last_printed = None
+    predicted_round_num = None
     between_rounds_printed = False
     try:
         for round_state in fetch_live_round_state(args.match, rounds=args.rounds):
@@ -73,18 +74,24 @@ def main() -> None:
                 if not between_rounds_printed:
                     print("between rounds -- no state to predict from", flush=True)
                 between_rounds_printed = True
-                last_printed = None
                 continue
             between_rounds_printed = False
-            if round_state == last_printed:
+            # parse_live_round.py keeps refining a round's equip_value
+            # tick by tick until that round's first kill locks it in (see
+            # its docstring) -- the FIRST tick of a new round is captured
+            # right as freeze time starts, before anyone's bought
+            # anything, so equip_value there can genuinely read $0.
+            # Predicting off that tick instead of the locked one is what
+            # produced misleading $0 equip predictions; wait for "locked".
+            if not round_state["locked"] or round_state["round_num"] == predicted_round_num:
                 continue
-            last_printed = round_state
+            predicted_round_num = round_state["round_num"]
 
             p_ct = predict_match_winner(round_state, simulator)
             print(
                 f"round {round_state['round_num']}: {round_state['ct_score']}-{round_state['t_score']} "
                 f"ct_equip={round_state['ct_equip_value']} t_equip={round_state['t_equip_value']} "
-                f"ct_streak={round_state['ct_loss_bonus_streak']} t_streak={round_state['t_loss_bonus_streak']} "
+                f"ct_loss_streak={round_state['ct_loss_bonus_streak']} t_loss_streak={round_state['t_loss_bonus_streak']} "
                 f"| P(CT wins match)={p_ct:.3f}",
                 flush=True,
             )

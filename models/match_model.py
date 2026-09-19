@@ -171,6 +171,24 @@ def _match_winner(ct_score, t_score):
     return None
 
 
+def _swaps_sides(total):
+    """Whether the pre-round state for `total` rounds-already-decided sits
+    on the far side of a CT/T label swap from `total - 1` -- i.e. whether
+    _advance_state's ct_score/t_score (and ct_streak/t_streak) for this
+    `total` refer to the OPPOSITE physical teams from `total - 1`'s. True
+    at halftime (entering round 13) and at each OT period's mid-point --
+    see module docstring. Shared with resolve()'s bottom-up combine step,
+    which must flip a child's cached "P(CT wins)" (defined per-state, in
+    that state's own CT/T labels) before folding it into a parent whose
+    CT/T labels refer to a different physical team whenever this is True
+    for the parent-to-child transition."""
+    if total == REGULATION_ROUNDS // 2:  # == 12: entering round 13, halftime
+        return True
+    if total >= REGULATION_ROUNDS:
+        return (total - REGULATION_ROUNDS) % OT_PERIOD_ROUNDS == OT_PERIOD_ROUNDS // 2
+    return False
+
+
 def _advance_state(state, ct_won, next_ct_equip, next_t_equip):
     """Applies one round's outcome to `state`, given the next round's
     already-forecast equip values (the same forecast for both branches --
@@ -183,17 +201,13 @@ def _advance_state(state, ct_won, next_ct_equip, next_t_equip):
     ct_equip, t_equip = next_ct_equip, next_t_equip
 
     total = ct_score + t_score
-    if total == REGULATION_ROUNDS // 2:  # == 12: entering round 13, halftime
+    if _swaps_sides(total):
         ct_score, t_score = t_score, ct_score
         ct_streak, t_streak = t_streak, ct_streak
-        ct_equip, t_equip = HALFTIME_CT_EQUIP, HALFTIME_T_EQUIP
-    elif total >= REGULATION_ROUNDS:
-        into_period = (total - REGULATION_ROUNDS) % OT_PERIOD_ROUNDS
-        if into_period == 0:  # start of a new OT period
-            ct_streak, t_streak = 1, 1
-        elif into_period == OT_PERIOD_ROUNDS // 2:  # mid-period side swap
-            ct_score, t_score = t_score, ct_score
-            ct_streak, t_streak = t_streak, ct_streak
+        if total == REGULATION_ROUNDS // 2:
+            ct_equip, t_equip = HALFTIME_CT_EQUIP, HALFTIME_T_EQUIP
+    elif total >= REGULATION_ROUNDS and (total - REGULATION_ROUNDS) % OT_PERIOD_ROUNDS == 0:
+        ct_streak, t_streak = 1, 1  # start of a new OT period
 
     return _State(ct_score, t_score, ct_equip, t_equip, ct_streak, t_streak)
 
@@ -346,7 +360,10 @@ class MatchSimulator:
             for s, p_ct, nce, nte in zip(states, p_ct_round, next_ct_equip, next_t_equip):
                 ct_child = _quantize(_advance_state(s, True, nce, nte))
                 t_child = _quantize(_advance_state(s, False, nce, nte))
-                children[s] = (p_ct, ct_child, t_child)
+                # Both branches land on the same total-rounds-decided, so
+                # whether this edge crosses a label swap depends only on s.
+                swapped = _swaps_sides(s.ct_score + s.t_score + 1)
+                children[s] = (p_ct, ct_child, t_child, swapped)
                 for child in (ct_child, t_child):
                     if child not in visited and self._resolved(child) is None:
                         visited.add(child)
@@ -370,10 +387,16 @@ class MatchSimulator:
         # bucket.
         for total in sorted(by_total, reverse=True):
             for s in by_total[total]:
-                p_ct, ct_child, t_child = children[s]
-                self._value_cache[s] = (
-                    p_ct * self._value_cache[ct_child] + (1 - p_ct) * self._value_cache[t_child]
-                )
+                p_ct, ct_child, t_child, swapped = children[s]
+                ct_val = self._value_cache[ct_child]
+                t_val = self._value_cache[t_child]
+                if swapped:
+                    # ct_child/t_child's own "P(CT wins)" is in THEIR
+                    # CT/T labels, which belong to the opposite physical
+                    # teams from s's -- flip both before folding them into
+                    # s's value, or s ends up holding P(s's T team wins).
+                    ct_val, t_val = 1.0 - ct_val, 1.0 - t_val
+                self._value_cache[s] = p_ct * ct_val + (1 - p_ct) * t_val
 
         return [self._value_cache[s] for s in start_states]
 

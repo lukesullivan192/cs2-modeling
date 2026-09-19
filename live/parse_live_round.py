@@ -4,7 +4,7 @@ ct_score, t_score, ct_equip_value, t_equip_value, ct_loss_bonus_streak,
 t_loss_bonus_streak -- the exact pre-round state
 models/match_model.py's MatchSimulator.p_ct_wins_match() takes -- so a live
 round's state can be fed straight into the match-winner DP. See
-live/run_match_model.py to do that live, round by round.
+live/run_live_model.py to do that live, round by round.
 
 Usage: python live/parse_live_round.py <hltv_match_url_or_id>
 
@@ -57,6 +57,13 @@ except ImportError:
     from fetch_live_match import fetch_live_match, resolve_url_and_id
 
 LIVE_ROUND_STATE = "started"
+# How much roundTimeRemainingMS must drop from its reading at this round's
+# first live tick before an equip snapshot with no kill yet is trusted as
+# final. Measured empirically against live traffic (see
+# fetch_live_round_state): per-player equipmentValue fully settled within
+# ~2000ms of round-clock time in every clean round-start observed; this
+# adds margin rather than cutting it close.
+EQUIP_SETTLE_MS = 3000
 
 
 def _equip_value(players):
@@ -80,7 +87,7 @@ def _trailing_losses(history):
     return streak
 
 
-def _extract_round_state(data, match_id):
+def _extract_round_state(data, match_id, locked):
     return {
         "match_id": match_id,
         "round_num": data.get("currentRound"),
@@ -90,32 +97,73 @@ def _extract_round_state(data, match_id):
         "t_equip_value": _equip_value(data.get("TERRORIST", [])),
         "ct_loss_bonus_streak": _trailing_losses(data.get("ctMatchHistory")),
         "t_loss_bonus_streak": _trailing_losses(data.get("terroristMatchHistory")),
+        # True once this round's first kill has locked the equip snapshot
+        # in place (see module docstring); False means equip_value is
+        # still climbing as buys land and shouldn't be trusted as final --
+        # a caller predicting once per round should wait for this to flip
+        # True rather than acting on the first tick of a new round, which
+        # is captured right at freeze time's start before anyone's bought
+        # anything (equip genuinely reads $0 at that instant).
+        "locked": locked,
     }
 
 
 def fetch_live_round_state(match: str, rounds: int = 0, verbose: bool = True):
     """Yields, once per scorebot tick, either the current round's pre-round
     state (ready for models/match_model.py's MatchSimulator -- see
-    live/run_match_model.py) or None while the match is between rounds.
+    live/run_live_model.py) or None while the match is between rounds.
 
     match: HLTV match URL or numeric match id.
     rounds: stop after N RoundEnd events (0: run until the caller stops iterating).
     """
     _url, match_id = resolve_url_and_id(match)
-    frozen_data = None   # this round's most recent still-nobody-dead scoreboard tick
-    locked = False        # True once this round's first kill has been seen
+    frozen_data = None          # this round's most recent still-nobody-dead scoreboard tick
+    locked = False               # True once this round's equip snapshot is considered final
+    round_start_remain_ms = None  # roundTimeRemainingMS at this round's first live tick
 
-    for ev in fetch_live_match(match, rounds=rounds, verbose=verbose):
+    for ev in fetch_live_match(match, rounds=rounds):
         if ev["event"] != "scoreboard":
             continue
         data = ev["data"]
-        is_live_round = data.get("live", True) and data.get("currentRoundState") == LIVE_ROUND_STATE
+        ct_players, t_players = data.get("CT", []), data.get("TERRORIST", [])
+        # Require both rosters to actually be populated: Python's all() is
+        # vacuously True over an empty list, so without this check a tick
+        # where one side's roster is momentarily empty (e.g. mid-rebuild
+        # right at a round transition) would silently pass as "all alive"
+        # below and get captured as this round's state -- summing that
+        # empty roster's equipmentValue then reports $0 for a side that,
+        # on the actual HLTV page, plainly isn't at $0.
+        is_live_round = (
+            data.get("live", True)
+            and data.get("currentRoundState") == LIVE_ROUND_STATE
+            and ct_players and t_players
+        )
 
         if is_live_round:
-            all_alive = all(p.get("alive", True) for side in ("CT", "TERRORIST") for p in data.get(side, []))
+            if round_start_remain_ms is None:
+                round_start_remain_ms = data.get("roundTimeRemainingMS")
+            all_alive = all(p.get("alive", True) for side in (ct_players, t_players) for p in side)
+            # roundTimeRemainingMS counts down from ~115000 starting on
+            # this round's very first "started" tick -- a server clock,
+            # not something derived from our own poll timing. Captured
+            # live traffic showed per-player equipmentValue fully settles
+            # within ~2000ms of round-clock time after that first tick
+            # (e.g. 0 -> 700 -> 1400 -> ... -> final value, done by
+            # roundTimeRemainingMS dropping ~2000 from its start-of-round
+            # reading), so once that much round-clock time has elapsed,
+            # the latest all-alive snapshot can be trusted as final
+            # without waiting for a kill -- which could otherwise be
+            # 10-100+ seconds into the round on a slow-playing side.
+            settled = (
+                round_start_remain_ms is not None
+                and data.get("roundTimeRemainingMS") is not None
+                and round_start_remain_ms - data["roundTimeRemainingMS"] >= EQUIP_SETTLE_MS
+            )
             if not locked:
                 if all_alive:
                     frozen_data = data
+                    if settled:
+                        locked = True
                 elif frozen_data is None:
                     if verbose:
                         print("joined mid-round after the first kill; using the "
@@ -127,8 +175,9 @@ def fetch_live_round_state(match: str, rounds: int = 0, verbose: bool = True):
         else:
             frozen_data = None
             locked = False
+            round_start_remain_ms = None
 
-        yield _extract_round_state(frozen_data, match_id) if (is_live_round and frozen_data) else None
+        yield _extract_round_state(frozen_data, match_id, locked) if (is_live_round and frozen_data) else None
 
 
 def main() -> None:
