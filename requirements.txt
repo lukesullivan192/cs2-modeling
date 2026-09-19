@@ -5,3 +5,4 @@ demoparser2>=0.1.9
 pandas>=2.0.0
 xgboost>=2.0.0
 scikit-learn>=1.4.0
+python-socketio[client]>=5.11.0

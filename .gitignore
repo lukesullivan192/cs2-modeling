@@ -3,5 +3,6 @@ __pycache__/
 demos/
 downloaded_files/
 data/
+models/saves/
 venv/
 .claude/

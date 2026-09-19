@@ -45,7 +45,7 @@ something this model invents), and the swap only ever happens mid-period,
 
 Two modes:
   train  Fits on the entire dataset and saves the model to
-         data/economy_model.json.
+         models/saves/economy_model.json.
   test   Fits on 80% of matches and evaluates MAE/RMSE on the held-out
          20%, match-grouped the same way round_model.py's test mode is
          (see its docstring for why a row-level split would leak).
@@ -75,7 +75,8 @@ import round_model
 
 DATA_DIR = "data"
 ROUND_DATA_CSV = os.path.join(DATA_DIR, "round_data.csv")
-MODEL_PATH = os.path.join(DATA_DIR, "economy_model.json")
+SAVE_DIR = os.path.join("models", "saves")
+MODEL_PATH = os.path.join(SAVE_DIR, "economy_model.json")
 
 ID_COL = "match_id"
 FEATURE_COLS = ["own_equip_value", "opp_equip_value", "own_loss_bonus_streak", "own_win_prob"]
@@ -239,7 +240,7 @@ def run_train(X, y, groups):
     model = _make_model(n_estimators=n_estimators)
     model.fit(X, y)
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(SAVE_DIR, exist_ok=True)
     model.save_model(MODEL_PATH)
     print(f"Trained on all {len(X)} perspective-row(s). Saved model to {MODEL_PATH}.")
 

@@ -20,7 +20,7 @@ module docstring.
 
 Two modes:
   train  Fits on the entire dataset and saves the model to
-         data/round_model.json.
+         models/saves/round_model.json.
   test   Fits on 80% of matches and evaluates on the held-out 20%, to
          estimate how well the model generalizes to matches it hasn't
          seen. The split is grouped by match_id, not a random row split:
@@ -51,7 +51,8 @@ from sklearn.model_selection import GroupShuffleSplit
 
 DATA_DIR = "data"
 ROUND_DATA_CSV = os.path.join(DATA_DIR, "round_data.csv")
-MODEL_PATH = os.path.join(DATA_DIR, "round_model.json")
+SAVE_DIR = os.path.join("models", "saves")
+MODEL_PATH = os.path.join(SAVE_DIR, "round_model.json")
 
 TARGET_COL = "winner_is_ct"
 ID_COL = "match_id"  # identifier for grouped splitting, not a feature -- see parse_demos.py
@@ -178,7 +179,7 @@ def run_train(X, y, groups):
     model = _make_model(n_estimators=n_estimators)
     model.fit(X, y)
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(SAVE_DIR, exist_ok=True)
     model.save_model(MODEL_PATH)
     print(f"Trained on all {len(X)} round(s). Saved model to {MODEL_PATH}.")
 

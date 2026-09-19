@@ -15,13 +15,13 @@ pip install -r requirements.txt
 
 1. Download demos from HLTV:
    ```bash
-   python demo_fetcher.py
+   python demos/fetch_demos.py
    ```
-   Saves `.dem` files into `demos/`.
+   Saves `.dem` files into `demos/saves/`.
 
 2. Parse demos into training data:
    ```bash
-   python parse_demos.py
+   python demos/parse_demos.py
    ```
    Writes two CSVs into `data/`:
    - `data.csv`: one row per mid-round game-state snapshot.
@@ -35,17 +35,17 @@ pip install -r requirements.txt
 
 3. Train/evaluate the round-winner model:
    ```bash
-   python round_model.py train   # fits on all data, saves data/round_model.json
-   python round_model.py test    # match-grouped 80/20 train/test MAE/log-loss report
+   python models/round_model.py train   # fits on all data, saves models/saves/round_model.json
+   python models/round_model.py test    # match-grouped 80/20 train/test MAE/log-loss report
    ```
    An XGBoost classifier predicting P(CT wins) a round from each side's
    equipment value entering it.
 
 4. Train/evaluate the round-to-round economy model:
    ```bash
-   python economy_model.py train
-   python economy_model.py test
-   python economy_model.py predict --ct-equip 4200 --t-equip 4200 \
+   python models/economy_model.py train
+   python models/economy_model.py test
+   python models/economy_model.py predict --ct-equip 4200 --t-equip 4200 \
        --ct-streak 1 --t-streak 1 --ct-win-prob 0.55
    ```
    An XGBoost regressor predicting each side's next-round equipment value
@@ -55,8 +55,8 @@ pip install -r requirements.txt
 
 5. Evaluate the match-outcome dynamic program:
    ```bash
-   python match_model.py train   # ensures round_model.json/economy_model.json exist
-   python match_model.py test    # match-level accuracy, broken down by round number
+   python models/match_model.py train   # ensures round_model.json/economy_model.json exist in models/saves/
+   python models/match_model.py test    # match-level accuracy, broken down by round number
    ```
    Chains `round_model` and `economy_model` into a full match simulation:
    from any round's pre-round state, it branches on who wins each
@@ -66,3 +66,30 @@ pip install -r requirements.txt
    reports how accurate the resulting match-winner prediction is at each
    round number, plus one overall average, against a naive
    "whoever's-currently-leading" baseline.
+
+6. Run the trained models live against an in-progress HLTV match:
+   ```bash
+   python live/run_match_model.py <hltv_match_url_or_id>
+   ```
+   e.g. `python live/run_match_model.py 2398160` or a full match URL.
+   Prints each round's pre-round state and `P(CT wins the match)` as soon
+   as it's available, updating live as the match is played. Trains
+   `round_model`/`economy_model` first (same as step 3-5's `train` modes)
+   if `models/saves/round_model.json`/`economy_model.json` don't exist
+   yet; otherwise loads them as-is.
+
+   This chains three pieces under `live/`, each usable on its own too:
+   - `fetch_live_match.py`: opens the match page in a real,
+     Cloudflare-cleared browser and taps its own WebSocket traffic to
+     capture HLTV's scorebot feed (score, live player/round state, kill
+     log) -- see its module docstring for why a plain socket.io client no
+     longer works.
+   - `parse_live_round.py`: turns that raw feed into one row per round in
+     `round_data.csv`'s exact shape (`match_id`, `round_num`, `ct_score`,
+     `t_score`, `ct_equip_value`, `t_equip_value`,
+     `ct_loss_bonus_streak`, `t_loss_bonus_streak`), tracking each
+     round's state until its first kill locks it in as "the instant
+     freeze time ends" (`python live/parse_live_round.py <match>` prints
+     just this, with no model involved).
+   - `run_match_model.py`: feeds each parsed round straight into
+     `MatchSimulator.p_ct_wins_match()` from step 5.
